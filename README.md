@@ -303,6 +303,10 @@ docker start mysql-mgr-1
 
 > 调优建议：根据宿主机内存修改 `innodb_buffer_pool_size`；根据云盘 IOPS 修改 `innodb_io_capacity`；
 > 修改后 `docker restart` 生效（`my.cnf` 为只读挂载时，请修改宿主机文件）。
+>
+> 存储注意：`innodb_flush_method=O_DIRECT` + `innodb_redo_log_capacity=4G` 在**网络文件系统**
+> （CephFS / NFS）上首次初始化会明显变慢（需创建 32 个 128M redo 文件），生产建议使用本地 SSD/NVMe，
+> 或把 `innodb_redo_log_capacity` 调小（如 `1G`）。
 
 ---
 
