@@ -135,6 +135,10 @@ ENV MYSQL_MAJOR=$MYSQL_SERIES \
     MYSQL_VERSION=$MYSQL_VERSION \
     GOSU_VERSION=$GOSU_VERSION
 
+# 自动调优开关(1=按容器 CPU/内存自动计算容量类参数; 0=关闭, 使用 my.cnf 内置默认值)
+ARG MYSQL_AUTO_TUNE=1
+ENV MYSQL_AUTO_TUNE=$MYSQL_AUTO_TUNE
+
 # 数据目录 / 工作目录
 ARG MYSQL_DIR=/var/lib/mysql
 ENV MYSQL_DIR=$MYSQL_DIR
@@ -196,15 +200,16 @@ COPY --from=builder /tmp/src/rootfs/usr/lib/mysql /usr/lib/mysql
 COPY --from=builder /tmp/src/rootfs/usr/share/mysql /usr/share/mysql
 COPY --from=builder /tmp/src/gosu /usr/local/bin/gosu
 
-# ***** 拷贝配置与入口脚本 *****
+# ***** 拷贝配置、入口脚本与自动调优脚本 *****
 COPY ["conf/mysql/", "/etc/mysql/"]
 COPY ["ps-entry.sh", "/docker-entrypoint.sh"]
+COPY ["scripts/mysql-config-tuner.sh", "/usr/local/bin/mysql-config-tuner.sh"]
 
 # ***** 初始化: 用户/目录/权限 + 自检 *****
 # mysql 用户 UID/GID 固定为 1001, 与 Percona 官方镜像及 k8s 部署(runAsUser: 1001)保持一致,
 # 便于宿主机目录授权与 k8s 静态 PV 复用。
 RUN set -eux; \
-    chmod +x /usr/local/bin/gosu /docker-entrypoint.sh; \
+    chmod +x /usr/local/bin/gosu /docker-entrypoint.sh /usr/local/bin/mysql-config-tuner.sh; \
     # 创建 mysql 用户/用户组(1001)
     if ! getent group mysql >/dev/null; then groupadd -r -g 1001 mysql; fi; \
     if ! getent passwd mysql >/dev/null; then \
@@ -228,7 +233,14 @@ RUN set -eux; \
     mysqld --version; \
     mysql --version; \
     mysqld --defaults-file=/etc/mysql/my.cnf --validate-config --user=mysql; \
-    echo "Percona Server ${MYSQL_VERSION} 运行环境自检通过"
+    # 自动调优脚本自检: 两种输出模式都要能跑通, 且生成的配置必须通过 mysqld 校验
+    mysql-config-tuner.sh summary > /dev/null; \
+    MYSQL_MEMORY_LIMIT=2Gi MYSQL_CPU_LIMIT=2 mysql-config-tuner.sh conf > /etc/mysql/conf.d/zz-auto-tuned.cnf; \
+    mysqld --defaults-file=/etc/mysql/my.cnf --validate-config --user=mysql; \
+    MYSQL_MEMORY_LIMIT=512Mi MYSQL_CPU_LIMIT=1 mysql-config-tuner.sh conf > /etc/mysql/conf.d/zz-auto-tuned.cnf; \
+    mysqld --defaults-file=/etc/mysql/my.cnf --validate-config --user=mysql; \
+    rm -f /etc/mysql/conf.d/zz-auto-tuned.cnf; \
+    echo "Percona Server ${MYSQL_VERSION} 运行环境与自动调优脚本自检通过"
 
 # ***** 容器信号处理 *****
 STOPSIGNAL SIGQUIT

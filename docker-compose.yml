@@ -17,15 +17,23 @@ services:
     environment:
       # 容器内时区(绝对时间与宿主机内核一致)
       TZ: Asia/Shanghai
+      # 自动调优(默认开启): 按容器 CPU/内存计算容量类参数
+      # 如需固定资源口径(例如限制容器资源但希望按物理机资源调优), 可显式指定:
+      # MYSQL_MEMORY_LIMIT: 8Gi
+      # MYSQL_CPU_LIMIT: "4"
+      # MYSQL_IOPS: "4000"          # 云盘按实际 IOPS 调整
+      # MYSQL_MAX_CONNECTIONS: "500"
+      # MYSQL_AUTO_TUNE: "1"        # 0 = 关闭自动调优, 使用 my.cnf 内置默认值
     ports:
       - "3306:3306"     # MySQL 协议
       - "33060:33060"   # X Protocol
     volumes:
       # 数据目录
       - ./data/mysql:/var/lib/mysql
-      # 配置文件(只读挂载, 与镜像内默认配置一致, 修改后重启生效)
+      # 基础配置(只读挂载, 与镜像内默认配置一致, 修改后重启生效)
       - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      - ./conf/mysql/conf.d:/etc/mysql/conf.d:ro
+      # conf.d 需可写: 容器启动时会生成 zz-auto-tuned.cnf(按 CPU/内存自动调优)
+      - ./conf/mysql/conf.d:/etc/mysql/conf.d
       # 时区文件(容器 TZ 已设置, 此处保证与宿主机一致)
       - /etc/localtime:/etc/localtime:ro
     ulimits:

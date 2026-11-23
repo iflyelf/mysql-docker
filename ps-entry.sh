@@ -312,6 +312,46 @@ docker_mgr_mark_bootstrapped() {
 	mysql_note "MGR: 已写入引导标记 ${DATADIR}/.mgr_bootstrapped (后续重启将自动加入组)"
 }
 
+# 按容器 CPU / 内存自动计算容量类参数, 生成带中文注释的配置并打印摘要
+#   - 仅在 root 阶段执行(需要写 /etc/mysql/conf.d), 生成后由 mysql_check_config 校验
+#   - 可用 MYSQL_AUTO_TUNE=0 关闭; 资源可用 MYSQL_MEMORY_LIMIT / MYSQL_CPU_LIMIT 覆盖
+docker_auto_tune_config() {
+	if [ "${MYSQL_AUTO_TUNE:-1}" = "0" ]; then
+		mysql_note "已通过 MYSQL_AUTO_TUNE=0 关闭自动调优"
+		return 0
+	fi
+	if [ "$(id -u)" != "0" ]; then
+		mysql_warn "非 root 运行, 跳过自动调优(如需生效请使用默认 root 入口, 或显式设置 MYSQL_AUTO_TUNE=0)"
+		return 0
+	fi
+
+	local tuner='/usr/local/bin/mysql-config-tuner.sh'
+	local confDir='/etc/mysql/conf.d'
+	local confFile="${confDir}/zz-auto-tuned.cnf"
+
+	[ -x "$tuner" ] || { mysql_warn "未找到调优脚本 ${tuner}, 跳过自动调优"; return 0; }
+	if [ ! -w "$confDir" ]; then
+		mysql_warn "配置目录不可写(${confDir}), 跳过自动调优(使用 my.cnf 内置默认值)"
+		return 0
+	fi
+
+	local tmp
+	tmp="$(mktemp)"
+	if ! "$tuner" conf > "$tmp"; then
+		rm -f "$tmp"
+		mysql_warn "自动调优脚本执行失败, 本次使用 my.cnf 内置默认值"
+		return 0
+	fi
+	mv "$tmp" "$confFile"
+	chmod 644 "$confFile"
+	mysql_note "已按容器资源生成自动调优配置: ${confFile}"
+
+	# 摘要打印到容器日志, 便于确认本次生效的资源与关键参数
+	while IFS= read -r line; do
+		[ -n "$line" ] && mysql_note "[tuner] ${line}"
+	done < <("$tuner" summary)
+}
+
 # 等待组内任意一个同伴的 33061 端口可达后再启动, 解决"节点同时启动但引导节点尚未就绪"的问题
 # (MGR 在启动时若无法联系到任何同伴, 会停在 OFFLINE, 需要重启才能重新加入)
 docker_mgr_wait_for_seeds() {
@@ -506,6 +546,8 @@ _main() {
 
 		# 生成 MGR 动态配置(需要 root 写 /etc/mysql/conf.d, 且必须早于配置检查)
 		docker_mgr_generate_config
+		# 按容器 CPU/内存自动计算容量类参数并生成带中文注释的配置(摘要打印到日志)
+		docker_auto_tune_config
 		mysql_check_config "$@"
 		# Load various environment variables
 		docker_setup_env "$@"

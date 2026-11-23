@@ -3,7 +3,8 @@ data/
 # 日志
 *.log
 logs/
-# 入口脚本运行时生成的 MGR 配置
+# 入口脚本运行时生成的配置(自动调优 / MGR 节点参数)
+conf/mysql/conf.d/zz-auto-tuned.cnf
 conf/mysql/conf.d/zz-mgr-auto.cnf
 # 系统文件
 .DS_Store

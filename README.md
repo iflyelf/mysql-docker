@@ -5,6 +5,8 @@
 
 - 构建阶段（builder）= `iflyelf/ubuntu:latest`：只做官方 deb 下载/解包/裁剪，不重装庞大工具链
 - 运行阶段（runtime）= `iflyelf/ubuntu:lite`：仅拷贝 mysqld、客户端、插件、字符集，并安装运行所需共享库
+- **自动调优**：容器启动时按 CPU / 内存 limit 自动计算连接数、缓冲池、redo、缓存、IO、线程等参数，
+  生成带中文注释的 `conf.d/zz-auto-tuned.cnf` 并自动 include，日志打印资源与关键参数摘要
 
 支持 `linux/amd64` 与 `linux/arm64` 多架构，标签为 `latest` 与当前版本号（如 `8.4.11-12`）。
 
@@ -14,11 +16,13 @@
 
 - [镜像获取](#镜像获取)
 - [多阶段构建](#多阶段构建)
+- [CPU / 内存自动调优](#cpu--内存自动调优)
 - [快速开始（单机）](#快速开始单机)
 - [MGR 3 节点集群部署](#mgr-3-节点集群部署)
 - [my.cnf 参数说明](#mycnf-参数说明)
 - [环境变量](#环境变量)
 - [自动构建与版本更新](#自动构建与版本更新)
+- [构建方式（不用 QEMU）](#构建方式不用-qemu)
 - [目录结构](#目录结构)
 - [备份与恢复](#备份与恢复)
 - [常见问题](#常见问题)
@@ -68,7 +72,11 @@ docker pull iflyelf/mysql:8.4.11-12
 > `ldd /usr/sbin/mysqld` 出现 `not found` 即构建失败的方式兜底，避免"镜像构建成功但起不来"。
 
 运行阶段环境变量：`TZ=Asia/Shanghai`、`LANG=zh_CN.UTF-8`、`MYSQL_MAJOR`、`MYSQL_VERSION`、
-`MYSQL_DIR=/var/lib/mysql`、`MYSQL_DATA=/var/lib/mysql`、`GOSU_VERSION`；入口使用 `tini` 处理信号与僵尸进程。
+`MYSQL_DIR=/var/lib/mysql`、`MYSQL_DATA=/var/lib/mysql`、`GOSU_VERSION`、`MYSQL_AUTO_TUNE=1`；
+入口使用 `tini` 处理信号与僵尸进程。
+
+运行阶段还会拷贝 `scripts/mysql-config-tuner.sh` 到 `/usr/local/bin/`，构建时对
+`conf` / `summary` 两种模式以及生成结果做 `mysqld --validate-config` 自检（不通过则构建失败）。
 
 构建参数：
 
@@ -79,6 +87,99 @@ docker pull iflyelf/mysql:8.4.11-12
 | `PERCONA_DISTRO` | `resolute` | Percona deb 发行版代号，**必须与运行基础镜像一致**（lite 当前为 Ubuntu 26.04） |
 | `GOSU_VERSION` | `1.20` | gosu 版本 |
 | `DOWNLOAD_PROXY` | 空 | 可选下载代理，如 `https://down.xiaonuo.live`（按 `?url=<原始地址>` 拼装） |
+
+---
+
+## CPU / 内存自动调优
+
+容器启动时 `mysql-config-tuner.sh` 探测容器 CPU / 内存限制
+（cgroup v2 优先，回退 v1，最后用宿主机值），自动计算连接数、InnoDB 内存、会话缓冲、表缓存、
+IO、线程、并行复制等参数，**生成带中文注释的配置**并写入 `/etc/mysql/conf.d/zz-auto-tuned.cnf`，
+由 `my.cnf` 的 `!includedir` 引入；容器日志会打印资源与关键参数摘要。
+
+- 每次启动重新生成（资源 limit 变化后重启即生效）
+- `my.cnf` 只保留结构/语义型参数（字符集、GTID、日志、持久化策略等），容量类参数全部自动计算
+- 生成内容每项都带中文注释与计算公式，例如：
+
+```ini
+# 缓冲池 = 内存 × 70% = 8192MB × 70% → 5734MB（限制 128MB~128GB）
+#   InnoDB 最热数据与索引缓存，是决定性能的最关键参数
+innodb_buffer_pool_size = 5734M
+
+# 最大连接数：自动计算(min(内存/16, CPU×400+100), 限制 100~10000)
+#   内存侧上限 = 内存(MB) ÷ 16 = 8192÷16 = 512
+#   CPU 侧上限  = CPU × 400 + 100 = 4×400+100 = 1700
+#   自动取值 = clamp(min(两者), 100, 10000) = 512
+max_connections = 512
+```
+
+启动日志摘要示例（`docker logs`）：
+
+```
+[Note] [Entrypoint]: [tuner] ===== MySQL 自动调优资源与关键参数 =====
+[Note] [Entrypoint]: [tuner] 内存                : 8192MB (自动探测(cgroup/宿主机))
+[Note] [Entrypoint]: [tuner] CPU                 : 4 核 (自动探测(cgroup/宿主机))
+[Note] [Entrypoint]: [tuner] max_connections     : 512
+[Note] [Entrypoint]: [tuner] innodb_buffer_pool  : 5734MB / 5 实例 (内存 70%)
+[Note] [Entrypoint]: [tuner] innodb_redo 容量    : 1433MB (缓冲池 25%)
+...
+```
+
+### 计算公式
+
+| 参数 | 计算公式 | 取值范围 |
+| --- | --- | --- |
+| `max_connections` | min(内存MB ÷ 16, CPU × 400 + 100) | 100~10000 |
+| `innodb_buffer_pool_size` | 内存 × 70% | 128MB~128GB |
+| `innodb_buffer_pool_instances` | 缓冲池 GiB 数 | 1~16 |
+| `innodb_redo_log_capacity` | 缓冲池 × 25% | 512MB~8GB（小内存自动下调） |
+| `innodb_log_buffer_size` | 缓冲池 ÷ 16 | 16MB~256MB |
+| `innodb_buffer_pool_dump_pct` | 固定 25% | — |
+| `read_buffer_size` / `read_rnd_buffer_size` | 内存 ÷ 4096 | 1MB~4MB |
+| `sort_buffer_size` / `join_buffer_size` | 内存 ÷ 2048 | 1MB~8MB |
+| `tmp_table_size` / `max_heap_table_size` | 内存 ÷ 32 | 16MB~512MB |
+| `max_allowed_packet` | 内存 ÷ 32 | 32MB~512MB |
+| `binlog_cache_size` | 内存 ÷ 4096 | 1MB~32MB |
+| `max_binlog_cache_size` | 内存 ÷ 4 | 256MB~4GB |
+| `table_open_cache` | CPU × 2048 | 2000~65535 |
+| `table_definition_cache` | table_open_cache ÷ 2 | 1000~65535 |
+| `table_open_cache_instances` | CPU 核数 | 1~16 |
+| `thread_cache_size` | CPU × 32 | 64~2048 |
+| `back_log` | CPU × 1024 | 1024~65535 |
+| `open_files_limit` | max_connections + table_open_cache×2 + 2048 | 65535~1048576 |
+| `innodb_open_files` | table_open_cache | 2000~65535 |
+| `innodb_io_capacity` | `MYSQL_IOPS`（默认 4000） | 100~200000 |
+| `innodb_io_capacity_max` | 基准 × 2 | — |
+| `innodb_lru_scan_depth` | 基准 ÷ 2 | 500~4000 |
+| `innodb_read_io_threads` / `write_io_threads` | CPU 核数 | 4~16 |
+| `innodb_purge_threads` | CPU ÷ 2 | 2~8 |
+| `replica_parallel_workers` | CPU 核数 | 4~32 |
+
+> 内存预算保护：当 `缓冲池 + redo + 日志缓冲` 超过「内存 - 保留（≥128MB）- 日志缓冲」时，
+> 脚本按 3:1 自动下调缓冲池与 redo，避免小内存容器 OOM（生成配置中会注明"已按内存预算下调"）。
+
+### 手动指定 / 关闭
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `MYSQL_MEMORY_LIMIT` | 手动指定内存口径，如 `8Gi` / `8192Mi` / `8589934592` |
+| `MYSQL_CPU_LIMIT` | 手动指定 CPU 口径，如 `4` / `2.5` / `500m` |
+| `MYSQL_MAX_CONNECTIONS` | 直接指定最大连接数（覆盖自动计算） |
+| `MYSQL_IOPS` | 磁盘 IOPS 基准（默认 4000 = SSD；HDD 200，NVMe 可 10000+） |
+| `MYSQL_AUTO_TUNE` | `0` = 关闭自动调优（使用 `my.cnf` 内置默认值，即 MySQL 官方默认） |
+
+在容器内预览或导出：
+
+```bash
+# 查看当前资源与关键参数摘要
+docker exec mysql mysql-config-tuner.sh summary
+
+# 查看将生成的完整配置（含中文注释与公式）
+docker exec mysql mysql-config-tuner.sh conf
+
+# 按指定资源口径预览（不改变运行中的实例）
+docker exec mysql env MYSQL_MEMORY_LIMIT=32Gi MYSQL_CPU_LIMIT=16 mysql-config-tuner.sh summary
+```
 
 ---
 
@@ -250,11 +351,14 @@ docker start mysql-mgr-1
 
 ## my.cnf 参数说明
 
-配置文件：
+配置文件按职责分成两类：
 
-- `conf/mysql/my.cnf`：基础配置（客户端/服务端/InnoDB/binlog/慢查询等）
-- `conf/mysql/conf.d/mgr.cnf`：MGR 组复制（全部 `loose_` 前缀，单机部署不生效也不报错）
-- `/etc/mysql/conf.d/zz-mgr-auto.cnf`（容器内）：**运行时自动生成**（`server_id`/`local_address`/`seeds`），不要手工改
+- **结构/语义型（固定）**：`conf/mysql/my.cnf` —— 数据目录、字符集、GTID、binlog、日志、
+  持久化策略（`innodb_flush_log_at_trx_commit`、`sync_binlog`）等
+- **容量/性能型（自动计算）**：`/etc/mysql/conf.d/zz-auto-tuned.cnf`（容器内）——
+  由 `mysql-config-tuner.sh` 按 CPU/内存生成，见 [CPU / 内存自动调优](#cpu--内存自动调优)
+- `conf/mysql/conf.d/mgr.cnf`：MGR 组复制基础配置（插件加载 + 主键约束；插件参数需 `loose_` 前缀）
+- `/etc/mysql/conf.d/zz-mgr-auto.cnf`（容器内）：启用 MGR 时自动生成（`server_id`/`local_address`/`seeds` 等），不要手工改
 
 ### 相对旧配置的清理（MySQL 8.4 已移除/废弃）
 
@@ -281,15 +385,16 @@ docker start mysql-mgr-1
 | 字符集 | `character_set_server` / `collation_server` | `utf8mb4` / `utf8mb4_0900_ai_ci` | 8.0+ 默认排序规则，MGR 各成员必须一致 |
 | 隔离级别 | `transaction_isolation` | `READ-COMMITTED` | 减少间隙锁，MGR 常用 |
 | 表名 | `lower_case_table_names` | `1` | **仅初始化时生效**，集群内必须一致 |
-| 连接 | `max_connections` | `10000` | k8s 参考值为 100000，容器内按内存下调 |
+| 连接 | `max_connections` / `back_log` | **自动调优** | 按内存与 CPU 计算（见上方公式表） |
 | 连接 | `wait_timeout` / `interactive_timeout` | `28800` | k8s 参考值为 2880000（33 天），此处按连接池习惯收敛 |
-| 包大小 | `max_allowed_packet` | `1G` | k8s 参考值为 5G，按常规业务收敛 |
+| 包大小 | `max_allowed_packet` | **自动调优** | 默认按内存 ÷ 32 计算（32MB~512MB） |
 | binlog | `binlog_row_image` | `FULL` | MGR 强制要求（8.4 起 `binlog_format` 已废弃，仅支持 ROW） |
 | binlog | `binlog_checksum` | `NONE` | MGR 要求 |
 | binlog | `sync_binlog` | `1` | 崩溃不丢事务 |
 | GTID | `gtid_mode` / `enforce_gtid_consistency` | `ON` | MGR/主从基础 |
-| InnoDB | `innodb_buffer_pool_size` | `2G` | 建议为容器内存 50%~75%，大内存请上调 |
-| InnoDB | `innodb_redo_log_capacity` | `4G` | 替代旧 `innodb_log_file_size` |
+| InnoDB | `innodb_buffer_pool_size` | **自动调优** | 内存 × 70%（128MB~128GB） |
+| InnoDB | `innodb_redo_log_capacity` | **自动调优** | 缓冲池 × 25%（替代旧 `innodb_log_file_size`） |
+| InnoDB | `innodb_io_capacity` | **自动调优** | 取 `MYSQL_IOPS`（默认 4000） |
 | InnoDB | `innodb_flush_log_at_trx_commit` | `1` | 最安全；追求吞吐可改 `2`（最多丢 1 秒） |
 | InnoDB | `innodb_flush_method` | `O_DIRECT` | 避免双缓冲 |
 | InnoDB | `innodb_numa_interleave` | `OFF` | k8s 参考值为 ON；容器默认无 `SYS_NICE` 权限会产生大量 mbind 告警，需要时用启动参数覆盖 |
@@ -301,18 +406,18 @@ docker start mysql-mgr-1
 | MGR | `group_replication_clone_threshold` | `1G` | 超过阈值用 clone 做全量恢复 |
 | MGR | `sql_require_primary_key` | `ON` | MGR 写入要求（仅 `mgr.cnf` 生效） |
 
-> 调优建议：根据宿主机内存修改 `innodb_buffer_pool_size`；根据云盘 IOPS 修改 `innodb_io_capacity`；
-> 修改后 `docker restart` 生效（`my.cnf` 为只读挂载时，请修改宿主机文件）。
+> 调优建议：容量类参数无需手工改，容器资源变化后重启即按新资源重新计算；
+> 需要固定口径时用 `MYSQL_MEMORY_LIMIT` / `MYSQL_CPU_LIMIT` / `MYSQL_IOPS` 指定。
 >
-> 存储注意：`innodb_flush_method=O_DIRECT` + `innodb_redo_log_capacity=4G` 在**网络文件系统**
-> （CephFS / NFS）上首次初始化会明显变慢（需创建 32 个 128M redo 文件），生产建议使用本地 SSD/NVMe，
-> 或把 `innodb_redo_log_capacity` 调小（如 `1G`）。
+> 存储注意：`innodb_flush_method=O_DIRECT` 在**网络文件系统**（CephFS / NFS）上性能较差，
+> 且 redo 文件在首次初始化时需要一次创建（大容量会明显变慢），生产建议使用本地 SSD/NVMe，
+> 或通过 `MYSQL_MEMORY_LIMIT` 调小内存口径以缩小 redo。
 
 ---
 
 ## 环境变量
 
-入口脚本兼容官方 MySQL 镜像的变量，并新增 MGR 相关变量。
+入口脚本兼容官方 MySQL 镜像的变量，并新增自动调优与 MGR 相关变量。
 
 ### 通用
 
@@ -329,6 +434,11 @@ docker start mysql-mgr-1
 | `MYSQL_ONETIME_PASSWORD` | 空 | root 密码首次登录需修改 |
 | `MYSQL_INITDB_SKIP_TZINFO` | 空 | 跳过导入时区表（不推荐） |
 | `TZ` | `Asia/Shanghai` | 时区 |
+| `MYSQL_AUTO_TUNE` | `1` | `1`=启动时按 CPU/内存自动计算容量类参数；`0`=关闭 |
+| `MYSQL_MEMORY_LIMIT` | 自动探测 | 手动指定内存口径（`8Gi`/`8192Mi`/字节数） |
+| `MYSQL_CPU_LIMIT` | 自动探测 | 手动指定 CPU 口径（`4`/`2.5`/`500m`） |
+| `MYSQL_MAX_CONNECTIONS` | 自动计算 | 直接指定最大连接数 |
+| `MYSQL_IOPS` | `4000` | 磁盘 IOPS 基准（影响 `innodb_io_capacity`） |
 
 所有 `*_PASSWORD` 变量均支持 `*_PASSWORD_FILE`（Docker secrets）形式。
 
@@ -390,6 +500,26 @@ concurrency:
 > （`8.4.x-y-1.<distro>`）不完全一致，且仓库包含多个历史分支，因此版本号以**官方 apt 索引**为准，
 > 而不是 GitHub API。
 
+### 构建方式（不用 QEMU）
+
+`amd64` 和 `arm64` 在两个**原生 runner** 上并行构建（`ubuntu-latest` 和 `ubuntu-24.04-arm`），
+各自先推送 `latest-amd64`、`latest-arm64` 这类单架构标签，最后由 `merge` 作业用
+`docker manifest` 合并成多架构清单。整个过程不需要 QEMU 模拟，构建时间从约 2 小时降到 10~20 分钟，
+产出的仍是 Docker v2 manifest list，华为云 SWR 可以正常拉取。
+
+```
+            push / schedule / dispatch / star
+                          │
+        ┌─────────────────┴──────────────────┐
+        ▼                                    ▼
+  ubuntu-latest (amd64 原生)          ubuntu-24.04-arm (arm64 原生)
+  构建并推送 mysql:*-amd64            构建并推送 mysql:*-arm64
+        └─────────────────┬──────────────────┘
+                          ▼
+             merge 作业：docker manifest create/push
+             → latest / 8.4.x-y 多架构清单(同时推送 Docker Hub + SWR)
+```
+
 ### 所需 Secrets
 
 | Secret | 说明 |
@@ -432,7 +562,9 @@ mysql-docker/
 │   └── .env_db_mgr               # MGR 集群公共环境变量
 ├── docker-compose.yml            # 单机部署
 ├── docker-compose-mgr.yml        # 3 节点 MGR 集群
-├── scripts/update-version.sh     # 版本号自动同步
+├── scripts/
+│   ├── mysql-config-tuner.sh     # CPU/内存自动调优(conf|summary, 中文注释)
+│   └── update-version.sh         # 版本号自动同步
 ├── .github/workflows/
 │   ├── docker-publish.yml        # 构建并推送(Docker Hub + 华为云 SWR)
 │   └── update-version.yml        # 定时同步版本号
@@ -504,7 +636,15 @@ SWR 不支持 OCI media types / attestation，本仓库工作流已关闭 `prove
 - 单机部署：仅 `mgr.cnf` 中的 `start_on_boot=OFF` 会产生 1 条提示
 - MGR 部署：容器内 `zz-mgr-auto.cnf` 的每个参数各产生 1 条提示（约 13 条），属预期行为
 
-**7. 想改用 Ubuntu 24.04 / 22.04 基础镜像**
+**7. 自动调优没有生效 / 想固定参数**
+
+- 确认启动日志有 `已按容器资源生成自动调优配置` 与 `[tuner]` 摘要；
+  未出现时检查 `MYSQL_AUTO_TUNE` 是否为 `0`、`/etc/mysql/conf.d` 是否可写（自定义挂载为 `:ro` 会导致跳过）
+- 想看生成结果：`docker exec mysql cat /etc/mysql/conf.d/zz-auto-tuned.cnf`
+- 想固定资源口径：设置 `MYSQL_MEMORY_LIMIT` / `MYSQL_CPU_LIMIT`（容器 limit 与期望口径不一致时常用）
+- 想完全手工调参：`MYSQL_AUTO_TUNE=0`，然后在 `my.cnf` 或自定义 `conf.d/*.cnf` 中写死参数
+
+**8. 想改用 Ubuntu 24.04 / 22.04 基础镜像**
 
 把 `Dockerfile` 中 `PERCONA_DISTRO` 改为 `noble` / `jammy`，并同步替换
 `iflyelf/ubuntu:latest`、`iflyelf/ubuntu:lite` 为对应版本镜像即可（deb 版本号不变）。
