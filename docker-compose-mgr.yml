@@ -1,0 +1,127 @@
+#=================================================
+#  3 节点 MGR(Group Replication)集群 —— 单主模式
+#
+#  首次部署:
+#    1) 三个节点都会各自初始化数据目录并创建账号
+#    2) mysql-mgr-1 的 MYSQL_MGR_BOOTSTRAP=1 会在初始化完成后引导新组
+#       (引导成功后在数据目录写入 .mgr_bootstrapped 标记, 后续重启不会重复引导, 避免脑裂)
+#    3) mysql-mgr-2 / mysql-mgr-3 启动后通过 group_replication_start_on_boot 自动加入组
+#
+#  启动: docker compose -f docker-compose-mgr.yml up -d
+#  查看: docker exec -it mysql-mgr-1 mysql -uroot -p -e \
+#          "SELECT MEMBER_HOST,MEMBER_PORT,MEMBER_STATE,MEMBER_ROLE FROM performance_schema.replication_group_members"
+#=================================================
+services:
+  mysql-mgr-1:
+    image: iflyelf/mysql:latest
+    container_name: mysql-mgr-1
+    hostname: mysql-mgr-1
+    restart: always
+    command: ["mysqld"]
+    env_file:
+      - ./.env_vars/.env_db_mgr
+    environment:
+      # 节点专属: server_id 必须唯一
+      MYSQL_SERVER_ID: "1"
+      # 节点专属: MGR 通信地址(与 networks 中的固定 IP 一致)
+      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.11:33061
+      # 仅首个节点首次初始化时置 1
+      MYSQL_MGR_BOOTSTRAP: "1"
+    ports:
+      - "13306:3306"
+    volumes:
+      - ./data/mgr/mysql-mgr-1:/var/lib/mysql
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
+      # 可写: 入口脚本会在此生成 zz-mgr-auto.cnf
+      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      mgr:
+        ipv4_address: 172.30.8.11
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  mysql-mgr-2:
+    image: iflyelf/mysql:latest
+    container_name: mysql-mgr-2
+    hostname: mysql-mgr-2
+    restart: always
+    command: ["mysqld"]
+    env_file:
+      - ./.env_vars/.env_db_mgr
+    environment:
+      MYSQL_SERVER_ID: "2"
+      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.12:33061
+      MYSQL_MGR_BOOTSTRAP: "0"
+    ports:
+      - "13307:3306"
+    volumes:
+      - ./data/mgr/mysql-mgr-2:/var/lib/mysql
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
+      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      mgr:
+        ipv4_address: 172.30.8.12
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  mysql-mgr-3:
+    image: iflyelf/mysql:latest
+    container_name: mysql-mgr-3
+    hostname: mysql-mgr-3
+    restart: always
+    command: ["mysqld"]
+    env_file:
+      - ./.env_vars/.env_db_mgr
+    environment:
+      MYSQL_SERVER_ID: "3"
+      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.13:33061
+      MYSQL_MGR_BOOTSTRAP: "0"
+    ports:
+      - "13308:3306"
+    volumes:
+      - ./data/mgr/mysql-mgr-3:/var/lib/mysql
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
+      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      mgr:
+        ipv4_address: 172.30.8.13
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+networks:
+  mgr:
+    driver: bridge
+    ipam:
+      config:
+        # 固定网段, 与 .env_vars/.env_db_mgr 中的 MYSQL_MGR_GROUP_SEEDS 保持一致
+        - subnet: 172.30.8.0/24

@@ -139,7 +139,9 @@ docker_temp_server_start() {
 		fi
 	else
 		# For 5.7+ the server is ready for use as soon as startup command unblocks
-		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}"; then
+		# 初始化/临时启动阶段必须关闭 MGR 自动入组, 否则空实例会尝试加入已有集群
+		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}" \
+			--loose-group_replication_start_on_boot=OFF; then
 			mysql_error "Unable to start server."
 		fi
 	fi
@@ -221,6 +223,7 @@ docker_setup_env() {
 	file_env 'MYSQL_USER'
 	file_env 'MYSQL_PASSWORD'
 	file_env 'MYSQL_ROOT_PASSWORD'
+	file_env 'MYSQL_REPL_USER' 'repl'
 	file_env 'MYSQL_REPL_PASSWORD'
 
 	declare -g DATABASE_ALREADY_EXISTS
@@ -228,6 +231,89 @@ docker_setup_env() {
 		DATABASE_ALREADY_EXISTS='true'
 	fi
 }
+
+# MGR 相关环境变量说明:
+#   MYSQL_MGR_GROUP_SEEDS  组内各成员的通信地址列表(host:33061,...)，设置后才启用 MGR
+#   MYSQL_MGR_LOCAL_ADDRESS 本节点通信地址(默认 <hostname>:33061)
+#   MYSQL_SERVER_ID        本节点 server_id(集群内唯一, 默认 1)
+#   MYSQL_MGR_GROUP_NAME   组名(UUID, 集群内一致)
+#   MYSQL_MGR_BOOTSTRAP    1 = 首次初始化时引导新组(仅首个节点首次启动使用)
+#   MYSQL_MGR_SINGLE_PRIMARY  ON/OFF，默认 ON(单主)
+# 根据环境变量生成 MGR 动态配置(必须早于配置检查执行)
+docker_mgr_generate_config() {
+	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+
+	local confDir='/etc/mysql/conf.d'
+	local confFile="${confDir}/zz-mgr-auto.cnf"
+	if [ ! -w "$confDir" ]; then
+		mysql_warn "配置目录不可写, 跳过 MGR 动态配置生成: $confDir"
+		return 0
+	fi
+
+	local serverId="${MYSQL_SERVER_ID:-1}"
+	local localAddr="${MYSQL_MGR_LOCAL_ADDRESS:-$(hostname):33061}"
+	local groupName="${MYSQL_MGR_GROUP_NAME:-d9b5b0c4-8f1e-11f0-9a52-0242ac110002}"
+	local singlePrimary="${MYSQL_MGR_SINGLE_PRIMARY:-ON}"
+
+	cat > "$confFile" <<-EOF
+		# 由 docker-entrypoint.sh 根据环境变量自动生成, 请勿手工修改
+		[mysqld]
+		server_id = ${serverId}
+		loose_group_replication_start_on_boot = ON
+		loose_group_replication_group_name = '${groupName}'
+		loose_group_replication_local_address = '${localAddr}'
+		loose_group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
+		loose_group_replication_single_primary_mode = ${singlePrimary}
+	EOF
+	chmod 644 "$confFile"
+	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} seeds=${MYSQL_MGR_GROUP_SEEDS}"
+}
+
+# 配置 MGR 分布式恢复(组复制)通道账号，需要在临时服务器中执行一次并持久化
+docker_mgr_setup_recovery() {
+	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+	if [ -z "${MYSQL_REPL_PASSWORD:-}" ]; then
+		mysql_warn "未设置 MYSQL_REPL_PASSWORD, MGR 分布式恢复可能失败"
+		return 0
+	fi
+	mysql_note "MGR: 配置分布式恢复通道 (${MYSQL_REPL_USER:-repl})"
+	docker_process_sql --database=mysql <<-EOSQL
+		SET @@SESSION.SQL_LOG_BIN=0;
+		CHANGE REPLICATION SOURCE TO
+			SOURCE_USER = '${MYSQL_REPL_USER:-repl}',
+			SOURCE_PASSWORD = '${MYSQL_REPL_PASSWORD}'
+			FOR CHANNEL 'group_replication_recovery';
+	EOSQL
+}
+
+# 首次初始化时引导 MGR 组(仅 MYSQL_MGR_BOOTSTRAP=1 且数据目录中无引导标记时执行)
+docker_mgr_bootstrap() {
+	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+	[ "${MYSQL_MGR_BOOTSTRAP:-0}" = "1" ] || return 0
+	if [ -f "$DATADIR/.mgr_bootstrapped" ]; then
+		mysql_note "MGR: 已引导过该组, 跳过 bootstrap(避免脑裂)"
+		return 0
+	fi
+
+	mysql_note "MGR: 首次引导组复制 (group_replication_bootstrap_group=ON)"
+	# 注意: 不使用 --skip-networking, MGR 需要正常监听/绑定通信端口;
+	#       start_on_boot 关闭, 由下面显式 bootstrap, 避免与自动入组冲突
+	"$@" --daemonize --socket="${SOCKET}" --loose-group_replication_start_on_boot=OFF \
+		|| mysql_error "MGR bootstrap: 临时服务器启动失败"
+	docker_process_sql --database=mysql <<-EOSQL
+		SET GLOBAL group_replication_bootstrap_group=ON;
+		START GROUP_REPLICATION;
+		SET GLOBAL group_replication_bootstrap_group=OFF;
+	EOSQL
+	docker_process_sql --database=mysql <<-EOSQL
+		SELECT MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE
+		FROM performance_schema.replication_group_members;
+	EOSQL
+	docker_temp_server_stop
+	touch "$DATADIR/.mgr_bootstrapped"
+	mysql_note "MGR: 引导完成, 后续启动将自动加入组"
+}
+
 
 # Execute sql script, passed via stdin
 # usage: docker_process_sql [--dont-use-mysql-root-password] [mysql-cli-args]
@@ -276,11 +362,13 @@ docker_setup_db() {
 	
 	local replCreate=
 	if [ -n "$MYSQL_REPL_PASSWORD" ]; then
+		# MySQL 8.4 起 mysql_native_password 默认禁用, 统一使用默认的 caching_sha2_password;
+		# MGR 分布式恢复通过 group_replication_recovery_get_public_key=ON + 该账号完成认证。
 		read -r -d '' replCreate <<-EOSQL || true
-		    CREATE USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY '${MYSQL_REPL_PASSWORD}';
-		    GRANT REPLICATION SLAVE,REPLICATION Client,BACKUP_ADMIN,PROCESS,RELOAD,LOCK TABLES ON *.* TO 'repl' @'%';
-		    GRANT SELECT ON PERFORMANCE_SCHEMA.log_status TO 'repl' @'%';
-                    GRANT SELECT ON PERFORMANCE_SCHEMA.keyring_component_status TO 'repl' @'%';
+			CREATE USER '${MYSQL_REPL_USER:-repl}'@'%' IDENTIFIED BY '${MYSQL_REPL_PASSWORD}' ;
+			GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN, PROCESS, RELOAD, LOCK TABLES, CONNECTION_ADMIN ON *.* TO '${MYSQL_REPL_USER:-repl}'@'%' ;
+			GRANT SELECT ON performance_schema.log_status TO '${MYSQL_REPL_USER:-repl}'@'%' ;
+			GRANT SELECT ON performance_schema.keyring_component_status TO '${MYSQL_REPL_USER:-repl}'@'%' ;
 		EOSQL
 	fi
 
@@ -367,6 +455,8 @@ _main() {
 	if [ "$1" = 'mysqld' ] && ! _mysql_want_help "$@"; then
 		mysql_note "Entrypoint script for MySQL Server ${MYSQL_VERSION} started."
 
+		# 生成 MGR 动态配置(必须在配置检查之前)
+		docker_mgr_generate_config
 		mysql_check_config "$@"
 		# Load various environment variables
 		docker_setup_env "$@"
@@ -393,6 +483,8 @@ _main() {
 
 			mysql_socket_fix
 			docker_setup_db
+			# 配置 MGR 分布式恢复通道(仅启用 MGR 时)
+			docker_mgr_setup_recovery
 			docker_process_init_files /docker-entrypoint-initdb.d/*
 
 			mysql_expire_root_user
@@ -407,6 +499,9 @@ _main() {
 		else
 			mysql_socket_fix
 		fi
+
+		# 首次初始化时按需引导 MGR 组
+		docker_mgr_bootstrap "$@"
 	fi
 	exec "$@"
 }

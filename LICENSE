@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2022 danxiaonuo
+Copyright (c) 2022 danxiaonuo (original project: https://github.com/danxiaonuo/mysql-docker)
+Copyright (c) 2022-2026 iflyelf (maintainer: https://github.com/iflyelf/mysql-docker)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

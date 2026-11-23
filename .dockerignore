@@ -1,0 +1,13 @@
+# 镜像构建上下文裁剪(仅 Dockerfile 需要的文件)
+.git
+.github
+.env_vars
+data
+logs
+*.log
+README.md
+docker-compose.yml
+docker-compose-mgr.yml
+LICENSE
+# 入口脚本生成的运行时配置
+conf/mysql/conf.d/zz-mgr-auto.cnf
