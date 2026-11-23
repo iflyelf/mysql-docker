@@ -491,11 +491,14 @@ chown -R 1001:1001 ./data/mysql
 SWR 不支持 OCI media types / attestation，本仓库工作流已关闭 `provenance`、`sbom`
 并指定 `oci-mediatypes=false`，多架构清单使用 `docker manifest` 生成（Docker v2）。
 
-**6. MGR 模式启动日志出现 `unknown variable 'loose_group_replication_*'`**
+**6. 启动日志出现 `unknown variable 'loose_group_replication_*'`**
 
 正常现象，可忽略。MySQL 在解析配置文件时组复制插件尚未初始化，插件参数必须使用 `loose_` 前缀
-（否则 `--initialize` 阶段会直接失败），因此启动时会为每个参数打印一次该提示，**参数值仍然生效**
-（可用 `SHOW VARIABLES LIKE 'group_replication%'` 验证）。单机部署不加载 MGR 参数，不会出现该提示。
+（否则 `--initialize` 阶段会直接失败），因此启动时会打印该提示，**参数值仍然生效**
+（可用 `SHOW VARIABLES LIKE 'group_replication%'` 验证）。
+
+- 单机部署：仅 `mgr.cnf` 中的 `start_on_boot=OFF` 会产生 1 条提示
+- MGR 部署：容器内 `zz-mgr-auto.cnf` 的每个参数各产生 1 条提示（约 13 条），属预期行为
 
 **7. 想改用 Ubuntu 24.04 / 22.04 基础镜像**
 

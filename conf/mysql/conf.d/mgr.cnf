@@ -17,6 +17,11 @@ plugin_load_add = group_replication.so
 # MGR 要求: 写入的表必须有主键(避免全量重启后无法恢复)
 sql_require_primary_key = ON
 
+# 默认不随服务器启动加入组: 单机部署(未配置 MYSQL_MGR_GROUP_SEEDS)时不会尝试启动组复制,
+# 避免启动日志出现 "The group_replication_group_name option is mandatory" 等报错。
+# 启用 MGR 时由入口脚本生成的 zz-mgr-auto.cnf 覆盖为 ON。
+loose_group_replication_start_on_boot = OFF
+
 #---------------------------------------------------------------------------
 # 以下参数在启用 MGR(MYSQL_MGR_GROUP_SEEDS 非空)时由入口脚本自动生成, 仅供查阅
 #---------------------------------------------------------------------------
