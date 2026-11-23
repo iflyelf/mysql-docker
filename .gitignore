@@ -3,6 +3,8 @@ data/
 # 日志
 *.log
 logs/
+# XtraBackup 备份输出
+backup/
 # 入口脚本运行时生成的配置(自动调优 / MGR 节点参数)
 conf/mysql/conf.d/zz-auto-tuned.cnf
 conf/mysql/conf.d/zz-mgr-auto.cnf

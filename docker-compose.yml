@@ -1,49 +1,165 @@
 #=================================================
-#  单机 MySQL 8.4 (Percona Server)
+#  单机版 Percona Server for MySQL 8.4
 #  启动: docker compose up -d
-#  集群: 见 docker-compose-mgr.yml
+#  定时备份(可选): docker compose --profile backup up -d
+#
+#  说明:
+#   - 网络采用固定 IPv4 + IPv6(与 autosys-docker 保持一致), 便于固定地址访问
+#   - MySQL 默认仅监听 IPv4(bind_address=0.0.0.0), IPv6 地址保留待用
+#   - 未开启 privileged / cap_add: MySQL 正常运行不需要内核特权;
+#     如需 NUMA 绑核可单独加 cap_add: [SYS_NICE](并在 my.cnf 打开 innodb_numa_interleave)
 #=================================================
+name: mysql
+
 services:
+
+  # 服务名
   mysql:
-    image: iflyelf/mysql:latest
-    container_name: mysql
+    # 模拟一个伪终端
+    tty: true
+    # 打开标准输入, 可以接受外部输入
+    stdin_open: true
+    # 主机名
     hostname: mysql
-    restart: always
-    # 覆盖默认启动参数(可按需追加, 例如 --skip-mysqlx)
+    # 指定容器名称
+    container_name: mysql
+    # 指定为镜像名称或镜像ID
+    image: iflyelf/mysql:latest
+    # 覆盖容器启动后默认执行的命令
+    # 说明: 容量类参数由 mysql-config-tuner.sh 自动生成, 这里只追加必要的运行参数
     command:
-      - mysqld
+     - mysqld
+    # 指定容器退出后的重启策略为始终重启
+    restart: always
+    # 数据卷所挂载路径设置
+    volumes:
+      # 数据目录(可读写)
+      - ./data/mysql:/var/lib/mysql:rw,cached
+      # 基础配置(只读挂载, 修改宿主机文件后重启生效)
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro,cached
+      # conf.d 需可写: 启动时会生成 zz-auto-tuned.cnf(按 CPU/内存自动调优)
+      - ./conf/mysql/conf.d:/etc/mysql/conf.d:rw,cached
+      # 同步宿主机时区与时间
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    # 环境变量
     env_file:
-      - ./.env_vars/.env_db_mysql
+     - ./.env_vars/.env_db_mysql
     environment:
-      # 容器内时区(绝对时间与宿主机内核一致)
+      # 容器内时区(绝对时间与宿主机内核一致, 这里只决定显示时区)
       TZ: Asia/Shanghai
       # 自动调优(默认开启): 按容器 CPU/内存计算容量类参数
-      # 如需固定资源口径(例如限制容器资源但希望按物理机资源调优), 可显式指定:
+      # 需要固定资源口径或云盘 IOPS 时取消注释并修改:
       # MYSQL_MEMORY_LIMIT: 8Gi
       # MYSQL_CPU_LIMIT: "4"
-      # MYSQL_IOPS: "4000"          # 云盘按实际 IOPS 调整
+      # MYSQL_IOPS: "4000"
       # MYSQL_MAX_CONNECTIONS: "500"
       # MYSQL_AUTO_TUNE: "1"        # 0 = 关闭自动调优, 使用 my.cnf 内置默认值
+    # 配置容器连接的网络
+    networks:
+      app_net:
+        ipv4_address: 172.186.0.2
+        ipv6_address: 2066::2
+    # 暴露端口信息
     ports:
-      - "3306:3306"     # MySQL 协议
-      - "33060:33060"   # X Protocol
-    volumes:
-      # 数据目录
-      - ./data/mysql:/var/lib/mysql
-      # 基础配置(只读挂载, 与镜像内默认配置一致, 修改后重启生效)
-      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      # conf.d 需可写: 容器启动时会生成 zz-auto-tuned.cnf(按 CPU/内存自动调优)
-      - ./conf/mysql/conf.d:/etc/mysql/conf.d
-      # 时区文件(容器 TZ 已设置, 此处保证与宿主机一致)
-      - /etc/localtime:/etc/localtime:ro
+    - "3306:3306"     # MySQL 协议
+    - "33060:33060"   # X Protocol
+    # 指定容器的 ulimits 限制值
     ulimits:
       nproc: 65535
       nofile:
-        soft: 65535
-        hard: 65535
+          soft: 65535
+          hard: 65535
+    # 健康检查(仅探测服务存活, 不校验账号)
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 60s
       retries: 3
+
+  # ---------------------------------------------------------------------------
+  #  XtraBackup 定时备份(可选服务, 不随主服务启动)
+  #  启动: docker compose --profile backup up -d
+  #  手动: docker compose --profile backup run --rm backup full
+  #  说明:
+  #   - 使用官方 percona/percona-xtrabackup:8.4 镜像(与本项目 MySQL 8.4 版本匹配)
+  #   - 默认每周日全量、其余每天增量(XB_BACKUP_TIME), 备份写入宿主机 ./backup
+  #   - 数据目录以只读方式挂载: xtrabackup 直接读取数据文件, 通过 TCP 连接实例
+  # ---------------------------------------------------------------------------
+  backup:
+    # 备份容器无需交互
+    tty: false
+    stdin_open: false
+    # 主机名
+    hostname: mysql-backup
+    # 指定容器名称
+    container_name: mysql-backup
+    # 指定为镜像名称或镜像ID
+    image: percona/percona-xtrabackup:8.4
+    # 以脚本的 cron 模式作为入口(常驻定时备份)
+    entrypoint: ["/bin/bash", "/opt/backup/xtrabackup-manage.sh", "cron"]
+    # 指定容器退出后的重启策略为始终重启
+    restart: unless-stopped
+    # 数据卷所挂载路径设置
+    volumes:
+      # 数据目录只读挂载(xtrabackup 需要读取数据文件)
+      - ./data/mysql:/var/lib/mysql:ro,cached
+      # 备份输出目录
+      - ./backup:/backup:rw,cached
+      # 备份/恢复脚本
+      - ./scripts/xtrabackup-manage.sh:/opt/backup/xtrabackup-manage.sh:ro
+      # 同步宿主机时区与时间
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    # 环境变量(数据库密码等复用同一份 env_file)
+    env_file:
+     - ./.env_vars/.env_db_mysql
+    environment:
+      TZ: Asia/Shanghai
+      # 通过服务名走 TCP 连接(备份容器与 mysql 不在同一进程空间)
+      XB_HOST: mysql
+      XB_PORT: "3306"
+      XB_BACKUP_DIR: /backup
+      # none(默认, 恢复最快) / zstd / lz4
+      XB_COMPRESS: none
+      # 保留最近 2 份全量(含其增量) + 7 天增量
+      XB_KEEP_FULL: "2"
+      XB_RETENTION_DAYS: "7"
+      # 每日备份时间(容器内时区已设为上海)
+      XB_BACKUP_TIME: "03:00"
+    # 配置容器连接的网络
+    networks:
+      app_net:
+        ipv4_address: 172.186.0.3
+        ipv6_address: 2066::3
+    # 解决容器的依赖(等主库健康后再备份)
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 指定容器的 ulimits 限制值
+    ulimits:
+      nproc: 65535
+      nofile:
+          soft: 65535
+          hard: 65535
+
+networks:
+  app_net:
+    driver: bridge
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.bridge.name: mysql_app_net
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_forwarding: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.host_binding_ipv4: "0.0.0.0"
+      com.docker.network.bridge.host_binding_ipv6: "::/0"
+      com.docker.network.driver.mtu: 1500
+    ipam:
+      driver: default
+      config:
+      - subnet: 172.186.0.0/24
+        gateway: 172.186.0.1
+      - subnet: 2066::/64
+        gateway: 2066::1

@@ -1,51 +1,81 @@
 #=================================================
 #  3 节点 MGR(Group Replication)集群 —— 单主模式
+#  启动: docker compose -f docker-compose-mgr.yml up -d
+#  定时备份(可选): docker compose -f docker-compose-mgr.yml --profile backup up -d
 #
 #  首次部署:
-#    1) 三个节点都会各自初始化数据目录并创建账号
-#    2) mysql-mgr-1 的 MYSQL_MGR_BOOTSTRAP=1 会在首次启动时由正式 mysqld 引导新组,
+#    1) 三个节点各自初始化数据目录并创建账号
+#    2) mysql-mgr-1 的 MYSQL_MGR_BOOTSTRAP=1 在首次启动时由正式 mysqld 引导新组,
 #       并在数据目录写入 .mgr_bootstrapped 标记(后续重启不再引导, 避免脑裂)
-#    3) mysql-mgr-2 / mysql-mgr-3 启动前先等待同伴 33061 可达, 再通过
-#       group_replication_start_on_boot 自动加入组
+#    3) mysql-mgr-2 / mysql-mgr-3 启动前先等待同伴 33061 可达, 再自动加入组
 #
-#  启动: docker compose -f docker-compose-mgr.yml up -d
-#  查看: docker exec -it mysql-mgr-1 mysql -uroot -p -e \
-#          "SELECT MEMBER_HOST,MEMBER_PORT,MEMBER_STATE,MEMBER_ROLE FROM performance_schema.replication_group_members"
+#  说明:
+#   - 网络采用固定 IPv4 + IPv6(与 autosys-docker 保持一致), MGR 通信地址需与固定 IP 一致
+#   - 节点 IP: 172.186.1.11 / .12 / .13, 与 .env_vars/.env_db_mgr 的 MYSQL_MGR_GROUP_SEEDS 对应
+#   - 未开启 privileged / cap_add: MySQL 正常运行不需要内核特权
 #=================================================
+name: mysql-mgr
+
 services:
+
+  # ---------------------------------------------------------------------------
+  #  MGR 节点 1(引导节点)
+  # ---------------------------------------------------------------------------
   mysql-mgr-1:
-    image: iflyelf/mysql:latest
-    container_name: mysql-mgr-1
+    # 模拟一个伪终端
+    tty: true
+    # 打开标准输入, 可以接受外部输入
+    stdin_open: true
+    # 主机名(同时用于 MGR 成员名/通信地址解析)
     hostname: mysql-mgr-1
+    # 指定容器名称
+    container_name: mysql-mgr-1
+    # 指定为镜像名称或镜像ID
+    image: iflyelf/mysql:latest
+    # 覆盖容器启动后默认执行的命令
+    command:
+     - mysqld
+    # 指定容器退出后的重启策略为始终重启
     restart: always
-    command: ["mysqld"]
+    # 数据卷所挂载路径设置
+    volumes:
+      # 数据目录(每节点独立)
+      - ./data/mgr/mysql-mgr-1:/var/lib/mysql:rw,cached
+      # 基础配置(所有节点相同, 只读挂载)
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro,cached
+      # 同步宿主机时区与时间
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    # 环境变量(集群公共参数)
     env_file:
-      - ./.env_vars/.env_db_mgr
+     - ./.env_vars/.env_db_mgr
     environment:
+      TZ: Asia/Shanghai
       # 节点专属: server_id 必须唯一
       MYSQL_SERVER_ID: "1"
       # 节点专属: MGR 通信地址(与 networks 中的固定 IP 一致)
-      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.11:33061
+      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.11:33061
       # 仅首个节点首次初始化时置 1
       MYSQL_MGR_BOOTSTRAP: "1"
-    ports:
-      - "13306:3306"
-    volumes:
-      - ./data/mgr/mysql-mgr-1:/var/lib/mysql
-      # 基础配置(所有节点相同, 只读挂载)
-      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      # 注意: 不挂载 conf.d。入口脚本会按节点环境变量在容器内生成
-      # /etc/mysql/conf.d/zz-mgr-auto.cnf(server_id/local_address/seeds),
-      # 若三个节点共用宿主机目录会互相覆盖, 因此保留在容器内。
-      - /etc/localtime:/etc/localtime:ro
+      # 自动调优(默认开启): 按容器 CPU/内存计算容量类参数
+      # MYSQL_MEMORY_LIMIT: 8Gi
+      # MYSQL_CPU_LIMIT: "4"
+      # MYSQL_IOPS: "4000"
+    # 配置容器连接的网络
     networks:
-      mgr:
-        ipv4_address: 172.30.8.11
+      mgr_net:
+        ipv4_address: 172.186.1.11
+        ipv6_address: 2066:1::11
+    # 暴露端口信息(宿主机可用 13306 连接本节点)
+    ports:
+    - "13306:3306"
+    # 指定容器的 ulimits 限制值
     ulimits:
       nproc: 65535
       nofile:
-        soft: 65535
-        hard: 65535
+          soft: 65535
+          hard: 65535
+    # 健康检查(仅探测服务存活)
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -53,34 +83,41 @@ services:
       start_period: 120s
       retries: 3
 
+  # ---------------------------------------------------------------------------
+  #  MGR 节点 2(从库, 同时作为默认备份节点)
+  # ---------------------------------------------------------------------------
   mysql-mgr-2:
-    image: iflyelf/mysql:latest
-    container_name: mysql-mgr-2
+    tty: true
+    stdin_open: true
     hostname: mysql-mgr-2
+    container_name: mysql-mgr-2
+    image: iflyelf/mysql:latest
+    command:
+     - mysqld
     restart: always
-    command: ["mysqld"]
-    env_file:
-      - ./.env_vars/.env_db_mgr
-    environment:
-      MYSQL_SERVER_ID: "2"
-      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.12:33061
-      MYSQL_MGR_BOOTSTRAP: "0"
-    ports:
-      - "13307:3306"
     volumes:
-      - ./data/mgr/mysql-mgr-2:/var/lib/mysql
-      # 基础配置(所有节点相同, 只读挂载)
-      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      # 不挂载 conf.d(节点差异化配置由入口脚本在容器内生成, 见 mysql-mgr-1 注释)
-      - /etc/localtime:/etc/localtime:ro
+      - ./data/mgr/mysql-mgr-2:/var/lib/mysql:rw,cached
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro,cached
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    env_file:
+     - ./.env_vars/.env_db_mgr
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_SERVER_ID: "2"
+      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.12:33061
+      MYSQL_MGR_BOOTSTRAP: "0"
     networks:
-      mgr:
-        ipv4_address: 172.30.8.12
+      mgr_net:
+        ipv4_address: 172.186.1.12
+        ipv6_address: 2066:1::12
+    ports:
+    - "13307:3306"
     ulimits:
       nproc: 65535
       nofile:
-        soft: 65535
-        hard: 65535
+          soft: 65535
+          hard: 65535
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -88,45 +125,111 @@ services:
       start_period: 120s
       retries: 3
 
+  # ---------------------------------------------------------------------------
+  #  MGR 节点 3(从库)
+  # ---------------------------------------------------------------------------
   mysql-mgr-3:
-    image: iflyelf/mysql:latest
-    container_name: mysql-mgr-3
+    tty: true
+    stdin_open: true
     hostname: mysql-mgr-3
+    container_name: mysql-mgr-3
+    image: iflyelf/mysql:latest
+    command:
+     - mysqld
     restart: always
-    command: ["mysqld"]
-    env_file:
-      - ./.env_vars/.env_db_mgr
-    environment:
-      MYSQL_SERVER_ID: "3"
-      MYSQL_MGR_LOCAL_ADDRESS: 172.30.8.13:33061
-      MYSQL_MGR_BOOTSTRAP: "0"
-    ports:
-      - "13308:3306"
     volumes:
-      - ./data/mgr/mysql-mgr-3:/var/lib/mysql
-      # 基础配置(所有节点相同, 只读挂载)
-      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      # 不挂载 conf.d(节点差异化配置由入口脚本在容器内生成, 见 mysql-mgr-1 注释)
-      - /etc/localtime:/etc/localtime:ro
+      - ./data/mgr/mysql-mgr-3:/var/lib/mysql:rw,cached
+      - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro,cached
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    env_file:
+     - ./.env_vars/.env_db_mgr
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_SERVER_ID: "3"
+      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.13:33061
+      MYSQL_MGR_BOOTSTRAP: "0"
     networks:
-      mgr:
-        ipv4_address: 172.30.8.13
+      mgr_net:
+        ipv4_address: 172.186.1.13
+        ipv6_address: 2066:1::13
+    ports:
+    - "13308:3306"
     ulimits:
       nproc: 65535
       nofile:
-        soft: 65535
-        hard: 65535
+          soft: 65535
+          hard: 65535
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin --protocol=socket --socket=/var/run/mysqld/mysqld.sock ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 120s
       retries: 3
+
+  # ---------------------------------------------------------------------------
+  #  XtraBackup 定时备份(可选服务, 不随集群启动)
+  #  启动: docker compose -f docker-compose-mgr.yml --profile backup up -d
+  #  说明:
+  #   - 固定在 SECONDARY(mysql-mgr-2)上备份, 减少对主库写入的影响
+  #   - 若主库发生切换导致 mysql-mgr-2 变为主库, 脚本会在日志提示角色, 备份仍可继续
+  #   - 使用官方 percona/percona-xtrabackup:8.4 镜像, 备份写入宿主机 ./backup
+  # ---------------------------------------------------------------------------
+  backup:
+    tty: false
+    stdin_open: false
+    hostname: mysql-mgr-backup
+    container_name: mysql-mgr-backup
+    image: percona/percona-xtrabackup:8.4
+    entrypoint: ["/bin/bash", "/opt/backup/xtrabackup-manage.sh", "cron"]
+    restart: unless-stopped
+    volumes:
+      # 只读挂载被备份节点的数据目录
+      - ./data/mgr/mysql-mgr-2:/var/lib/mysql:ro,cached
+      - ./backup:/backup:rw,cached
+      - ./scripts/xtrabackup-manage.sh:/opt/backup/xtrabackup-manage.sh:ro
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro,cached
+      - /etc/localtime:/etc/localtime:ro,cached
+    env_file:
+     - ./.env_vars/.env_db_mgr
+    environment:
+      TZ: Asia/Shanghai
+      XB_HOST: mysql-mgr-2
+      XB_PORT: "3306"
+      XB_BACKUP_DIR: /backup
+      XB_COMPRESS: none
+      XB_KEEP_FULL: "2"
+      XB_RETENTION_DAYS: "7"
+      XB_BACKUP_TIME: "03:00"
+    networks:
+      mgr_net:
+        ipv4_address: 172.186.1.14
+        ipv6_address: 2066:1::14
+    depends_on:
+      mysql-mgr-2:
+        condition: service_healthy
+    ulimits:
+      nproc: 65535
+      nofile:
+          soft: 65535
+          hard: 65535
 
 networks:
-  mgr:
+  mgr_net:
     driver: bridge
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.bridge.name: mysql_mgr_net
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_forwarding: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.host_binding_ipv4: "0.0.0.0"
+      com.docker.network.bridge.host_binding_ipv6: "::/0"
+      com.docker.network.driver.mtu: 1500
     ipam:
+      driver: default
       config:
-        # 固定网段, 与 .env_vars/.env_db_mgr 中的 MYSQL_MGR_GROUP_SEEDS 保持一致
-        - subnet: 172.30.8.0/24
+      - subnet: 172.186.1.0/24
+        gateway: 172.186.1.1
+      - subnet: 2066:1::/64
+        gateway: 2066:1::1

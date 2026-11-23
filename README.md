@@ -24,7 +24,7 @@
 - [自动构建与版本更新](#自动构建与版本更新)
 - [构建方式（不用 QEMU）](#构建方式不用-qemu)
 - [目录结构](#目录结构)
-- [备份与恢复](#备份与恢复)
+- [备份与恢复（XtraBackup）](#备份与恢复percona-xtrabackup-84)
 - [常见问题](#常见问题)
 
 ---
@@ -191,12 +191,15 @@ cd /xiaonuo/workspace/docker/mysql-docker
 cp .env_vars/.env_db_mysql .env_vars/.env_db_mysql.local   # 可选
 vi .env_vars/.env_db_mysql
 
-# 2) 启动
+# 2) 启动(项目名固定为 mysql, 网络 172.186.0.0/24 双栈)
 docker compose up -d
 
-# 3) 查看日志 / 状态
+# 3) 查看日志 / 状态(日志包含自动调优摘要)
 docker compose logs -f mysql
 docker compose ps
+
+# 4) 定时备份(可选, 默认不启动)
+docker compose --profile backup up -d
 ```
 
 不使用 compose：
@@ -241,14 +244,15 @@ mysql -h127.0.0.1 -P3306 -uroot -p
 ```
         ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
         │ mysql-mgr-1  │   │ mysql-mgr-2  │   │ mysql-mgr-3  │
-        │ 172.30.8.11  │   │ 172.30.8.12  │   │ 172.30.8.13  │
+        │172.186.1.11  │   │172.186.1.12  │   │172.186.1.13  │
         │  host:13306  │   │  host:13307  │   │  host:13308  │
         └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
                └──────── 33061 组通信(XCom) ─────────┘
                   单主模式：自动选举 Primary / Secondary
 ```
 
-- 网络：独立 bridge 网络 `172.30.8.0/24`，固定 IP 保证 `group_replication_local_address` 稳定
+- 网络：独立 bridge 网络 `172.186.1.0/24`（双栈，另含 `2066:1::/64`），固定 IP 保证
+  `group_replication_local_address` 稳定；compose 项目名固定为 `mysql-mgr`，与单机栈互不冲突
 - 数据：`./data/mgr/mysql-mgr-{1,2,3}`
 - 配置：`conf/mysql/my.cnf`（基础，只读挂载）+ 镜像内 `conf/mysql/conf.d/mgr.cnf`（组复制）
   + 入口脚本在**容器内**生成的 `/etc/mysql/conf.d/zz-mgr-auto.cnf`（节点差异化参数：
@@ -272,7 +276,7 @@ docker logs -f mysql-mgr-1
 首次启动日志关键行：
 
 ```
-[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.30.8.11:33061 bootstrap=ON seeds=...
+[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.186.1.11:33061 bootstrap=ON seeds=...
 [Entrypoint]: MGR: 配置分布式恢复通道 (repl)
 [Entrypoint]: MGR: 首次启动, 本次将引导新组(bootstrap=ON)
 ```
@@ -345,7 +349,7 @@ docker start mysql-mgr-1
 | 组成员发现 | Pod 域名:33061 | 固定 IP:33061 |
 | 数据持久化 | CephFS 静态 PV | 宿主机目录 `./data/mgr/*` |
 | 账号 | Secret 统一注入 | `.env_vars/.env_db_mgr` |
-| 备份 | XtraBackup + S3 | 见[备份与恢复](#备份与恢复) |
+| 备份 | XtraBackup + S3 | 见[备份与恢复](#备份与恢复percona-xtrabackup-84) |
 
 ---
 
@@ -439,6 +443,7 @@ docker start mysql-mgr-1
 | `MYSQL_CPU_LIMIT` | 自动探测 | 手动指定 CPU 口径（`4`/`2.5`/`500m`） |
 | `MYSQL_MAX_CONNECTIONS` | 自动计算 | 直接指定最大连接数 |
 | `MYSQL_IOPS` | `4000` | 磁盘 IOPS 基准（影响 `innodb_io_capacity`） |
+| `XB_*` | 见[备份与恢复](#备份与恢复percona-xtrabackup-84) | 备份容器（`backup` 服务）专用变量，与 MySQL 进程无关 |
 
 所有 `*_PASSWORD` 变量均支持 `*_PASSWORD_FILE`（Docker secrets）形式。
 
@@ -560,10 +565,12 @@ mysql-docker/
 ├── .env_vars/
 │   ├── .env_db_mysql             # 单机环境变量
 │   └── .env_db_mgr               # MGR 集群公共环境变量
-├── docker-compose.yml            # 单机部署
-├── docker-compose-mgr.yml        # 3 节点 MGR 集群
+├── docker-compose.yml            # 单机部署(含 backup 可选服务)
+├── docker-compose-mgr.yml        # 3 节点 MGR 集群(含 backup 可选服务)
+├── backup/                       # 备份输出目录(运行时创建, 已 gitignore)
 ├── scripts/
 │   ├── mysql-config-tuner.sh     # CPU/内存自动调优(conf|summary, 中文注释)
+│   ├── xtrabackup-manage.sh      # XtraBackup 全量/增量/准备/恢复/定时(full|incremental|...)
 │   └── update-version.sh         # 版本号自动同步
 ├── .github/workflows/
 │   ├── docker-publish.yml        # 构建并推送(Docker Hub + 华为云 SWR)
@@ -574,24 +581,112 @@ mysql-docker/
 
 ---
 
-## 备份与恢复
+## 备份与恢复（Percona XtraBackup 8.4）
 
-```bash
-# 逻辑备份(单库 / 全库)
-docker exec mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" \
-  --single-transaction --source-data=2 --set-gtid-purged=ON xiaonuo' > xiaonuo-$(date +%F).sql
+物理热备方案：**XtraBackup 8.4**（与 Percona Server 8.4 版本匹配，支持全量 / 增量 / 压缩 / 在线备份），
+备份脚本 [`scripts/xtrabackup-manage.sh`](./scripts/xtrabackup-manage.sh) 已内置中文注释与保留策略。
 
-# 物理备份(需要 Percona XtraBackup 8.4 镜像, 与 Percona Server 版本对应)
-docker run --rm --volumes-from mysql \
-  -v "$PWD/backup:/backup" \
-  percona/percona-xtrabackup:8.4 \
-  xtrabackup --backup --target-dir=/backup/full --user=root --password='ysyh!9Sky'
+> XtraBackup 不打包进 MySQL 镜像（保持运行镜像精简），通过官方 `percona/percona-xtrabackup:8.4`
+> 镜像以**独立备份容器**运行；数据目录以只读方式挂载给它，通过 TCP 连接实例。
 
-# 恢复
-docker exec -i mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' < xiaonuo-2026-01-01.sql
+### 目录结构与保留策略
+
+```
+./backup/
+├── full/20261123-031500/    # 全量备份(每周日)
+├── inc/20261124-031500/     # 增量备份(其余每天, 基于最近一次全量/增量)
+└── .last-run-2026-11-23     # 定时任务去重标记
 ```
 
-MGR 场景建议：备份在 **SECONDARY** 节点执行，避免影响主库；`xtrabackup` 备份可用于成员全量恢复（clone/xtrabackup）。
+- 默认保留最近 **2 份全量**（含其增量链）+ **7 天增量**（`XB_KEEP_FULL` / `XB_RETENTION_DAYS`）
+- 备份格式为未压缩目录（`XB_COMPRESS=none`，恢复最快）；可选 `zstd` / `lz4`
+
+### 手动备份
+
+```bash
+# 全量
+docker compose --profile backup run --rm backup full
+
+# 增量（基于最近一次全量或增量）
+docker compose --profile backup run --rm backup incremental
+
+# 查看备份列表（含是否已 prepare）
+docker compose --profile backup run --rm backup list
+
+# 清理旧备份（默认按保留策略，也可在备份后自动执行）
+docker compose --profile backup run --rm backup prune
+```
+
+### 定时备份
+
+```bash
+# 启动常驻备份容器：周日全量、其余每天增量，默认 03:00（容器时区 Shanghai）
+docker compose --profile backup up -d
+
+# 查看备份日志
+docker logs -f mysql-backup
+```
+
+`backup` 服务使用 `profiles: ["backup"]`，**不会**随 `docker compose up -d` 自动启动。
+
+### 恢复
+
+```bash
+# 1) 准备备份（应用 redo，增量链按时间顺序依次应用；最后一步不带 --apply-log-only）
+docker compose --profile backup run --rm backup prepare full/20261123-031500
+
+# 2) 停止 MySQL（恢复前必须停止，避免数据目录被写坏）
+docker compose stop mysql
+
+# 3) 恢复（脚本会先把原数据目录重命名为 /var/lib/mysql.bak-<时间戳>，便于回滚）
+docker compose --profile backup run --rm \
+  -v "$PWD/data/mysql:/var/lib/mysql" backup restore full/20261123-031500
+
+# 4) 启动并检查错误日志
+docker compose start mysql
+docker compose logs -f mysql
+```
+
+> 恢复容器默认只读挂载数据目录；恢复时需要写权限，因此上面用 `-v` 覆盖为可写挂载。
+
+### MGR 集群备份与恢复
+
+```bash
+# 在 SECONDARY(mysql-mgr-2)上备份，减少对主库写入的影响
+docker compose -f docker-compose-mgr.yml --profile backup up -d
+docker compose -f docker-compose-mgr.yml --profile backup run --rm backup full
+```
+
+- 备份由 `backup` 服务固定指向 `mysql-mgr-2`（`XB_HOST`），主库切换后仍可备份（日志会提示角色）
+- **成员恢复**：优先让 MGR 用 `clone` 插件自动重建故障成员（`group_replication_clone_threshold=1G`），
+  比手工恢复更快且不会引入 GTID 不一致
+- **全集群灾难恢复**：按「单机恢复」步骤把备份恢复到 mysql-mgr-1，清空其他节点数据目录后依次启动
+  （mysql-mgr-1 需保留 `MYSQL_MGR_BOOTSTRAP=1` 且删除 `.mgr_bootstrapped` 重新引导）；
+  恢复后核对 `xtrabackup_binlog_info` 中的 GTID 与组内一致
+- 备份期间 `xtrabackup` 会短暂加全局锁（`--no-backup-locks=false` 默认使用 backup locks，MySQL 8.4 无阻塞）
+
+### 常用环境变量（backup 服务）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `XB_HOST` / `XB_PORT` | `mysql` / `3306` | 备份连接地址（MGR 为 `mysql-mgr-2`） |
+| `XB_BACKUP_DIR` | `/backup` | 备份根目录（宿主机 `./backup`） |
+| `XB_COMPRESS` | `none` | `none` / `zstd` / `lz4` |
+| `XB_PARALLEL` | `2` | xtrabackup 并行线程数 |
+| `XB_KEEP_FULL` | `2` | 保留全量份数（含增量链） |
+| `XB_RETENTION_DAYS` | `7` | 增量保留天数 |
+| `XB_BACKUP_TIME` | `03:00` | 每日备份时间（容器时区） |
+| `XB_USER` / `XB_PASSWORD` | `root` / `$MYSQL_ROOT_PASSWORD` | 备份账号（需 `BACKUP_ADMIN` 权限） |
+| `XB_EXTRA_ARGS` | 空 | 追加给 xtrabackup 的额外参数 |
+
+### 逻辑备份（补充）
+
+小容量库或需要单表导出时仍可使用 `mysqldump`：
+
+```bash
+docker exec mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" \
+  --single-transaction --source-data=2 --set-gtid-purged=ON xiaonuo' > xiaonuo-$(date +%F).sql
+```
 
 ---
 
