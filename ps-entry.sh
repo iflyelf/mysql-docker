@@ -155,17 +155,19 @@ docker_temp_server_stop() {
 	fi
 }
 
+# 内置默认超级用户密码(未指定 MYSQL_ROOT_PASSWORD 等变量时使用)
+#   可用 MYSQL_DEFAULT_ROOT_PASSWORD 覆盖内置默认值;
+#   生产环境请务必通过 MYSQL_ROOT_PASSWORD 或 *_FILE(Docker secrets) 指定
+DEFAULT_ROOT_PASSWORD="${MYSQL_DEFAULT_ROOT_PASSWORD:-ysyh!9Sky}"
+
 # Verify that the minimally required password settings are set for new databases.
 docker_verify_minimum_env() {
 	if [ -z "$MYSQL_ROOT_PASSWORD" -a -z "$MYSQL_ALLOW_EMPTY_PASSWORD" -a -z "$MYSQL_RANDOM_ROOT_PASSWORD" -a -z "$MYSQL_REPL_PASSWORD" ]; then
-		mysql_error <<-'EOF'
-			Database is uninitialized and password option is not specified
-			    You need to specify one of the following:
-			    - MYSQL_ROOT_PASSWORD
-			    - MYSQL_ALLOW_EMPTY_PASSWORD
-			    - MYSQL_RANDOM_ROOT_PASSWORD
-		            - MYSQL_REPL_PASSWORD
-		EOF
+		# 未指定任何密码相关变量: 使用内置默认超级用户密码, 并打印醒目告警
+		MYSQL_ROOT_PASSWORD="$DEFAULT_ROOT_PASSWORD"
+		export MYSQL_ROOT_PASSWORD
+		mysql_warn "未指定 MYSQL_ROOT_PASSWORD / MYSQL_ALLOW_EMPTY_PASSWORD / MYSQL_RANDOM_ROOT_PASSWORD,"
+		mysql_warn "已使用内置默认超级用户密码(用户 root); 生产环境请通过环境变量或 Docker secrets 覆盖!"
 	fi
 
 	# This will prevent the CREATE USER from failing (and thus exiting with a half-initialized database)
@@ -590,6 +592,9 @@ _main() {
 			mysql_note "Temporary server stopped"
 
 			echo
+			if [ "$MYSQL_ROOT_PASSWORD" = "$DEFAULT_ROOT_PASSWORD" ]; then
+				mysql_note "本次初始化使用内置默认超级用户密码(root), 请尽快修改: ALTER USER 'root'@'localhost' IDENTIFIED BY '<新密码>';"
+			fi
 			mysql_note "MySQL init process done. Ready for start up."
 			echo
 		else

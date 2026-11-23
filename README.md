@@ -50,6 +50,7 @@ docker pull iflyelf/mysql:8.4.11-12
 | 架构 | `linux/amd64`、`linux/arm64` |
 | 端口 | `3306`（MySQL 协议）、`33060`（X Protocol）、`33061`（MGR 组通信） |
 | 用户 | 容器内 `mysql` 用户，**UID/GID = 1001**（与 Percona 官方镜像、k8s 部署一致） |
+| 默认超级用户密码 | `ysyh!9Sky`（未指定 `MYSQL_ROOT_PASSWORD` 时启用，启动日志会告警提醒修改） |
 | 配置目录 | `/etc/mysql/my.cnf` + `/etc/mysql/conf.d/*.cnf` |
 | 数据目录 | `/var/lib/mysql`（`VOLUME`） |
 
@@ -187,9 +188,10 @@ docker exec mysql env MYSQL_MEMORY_LIMIT=32Gi MYSQL_CPU_LIMIT=16 mysql-config-tu
 ## 快速开始（单机）
 
 ```bash
-# 1) 准备环境变量（务必修改密码）
+# 1) 准备环境变量
+#    仓库内 .env_vars/.env_db_mysql 已预置默认密码 ysyh!9Sky(超级用户/业务用户/复制用户),
+#    内网测试可直接启动; 生产环境请务必修改
 cd /xiaonuo/workspace/docker/mysql-docker
-cp .env_vars/.env_db_mysql .env_vars/.env_db_mysql.local   # 可选
 vi .env_vars/.env_db_mysql
 
 # 2) 启动(项目名固定为 mysql, 网络 172.21.4.0/24 双栈)
@@ -447,7 +449,8 @@ docker start mysql-mgr-1
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MYSQL_ROOT_PASSWORD` | 无（首次必须） | root 密码；也支持 `MYSQL_ROOT_PASSWORD_FILE` |
+| `MYSQL_ROOT_PASSWORD` | `ysyh!9Sky` | root 密码（未指定时使用内置默认值并在日志告警）；也支持 `MYSQL_ROOT_PASSWORD_FILE` |
+| `MYSQL_DEFAULT_ROOT_PASSWORD` | `ysyh!9Sky` | 内置默认 root 密码（可覆盖镜像默认值，通常无需设置） |
 | `MYSQL_ROOT_HOST` | `%` | root 允许来源 |
 | `MYSQL_DATABASE` | 空 | 初始化创建的库 |
 | `MYSQL_USER` / `MYSQL_PASSWORD` | 空 | 初始化创建的业务账号（对该库全权限） |
@@ -763,7 +766,22 @@ SWR 不支持 OCI media types / attestation，本仓库工作流已关闭 `prove
 - 想固定资源口径：设置 `MYSQL_MEMORY_LIMIT` / `MYSQL_CPU_LIMIT`（容器 limit 与期望口径不一致时常用）
 - 想完全手工调参：`MYSQL_AUTO_TUNE=0`，然后在 `my.cnf` 或自定义 `conf.d/*.cnf` 中写死参数
 
-**8. 想改用 Ubuntu 24.04 / 22.04 基础镜像**
+**8. 如何修改默认超级用户密码 `ysyh!9Sky`**
+
+```bash
+# 运行中实例(立即生效, 永久生效)
+docker exec -it mysql mysql -uroot -p'ysyh!9Sky' \
+  -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '<新密码>'; ALTER USER 'root'@'%' IDENTIFIED BY '<新密码>';"
+
+# 同时修改编排配置(下次重建容器仍生效)
+vi .env_vars/.env_db_mysql    # MYSQL_ROOT_PASSWORD=<新密码>
+docker compose up -d
+```
+
+> 默认密码仅在**首次初始化**数据目录时写入; 数据目录已存在时修改 `MYSQL_ROOT_PASSWORD` 不会自动改密码,
+> 必须用上面的 `ALTER USER`(或用 `--init-file` 重置)。
+
+**9. 想改用 Ubuntu 24.04 / 22.04 基础镜像**
 
 把 `Dockerfile` 中 `PERCONA_DISTRO` 改为 `noble` / `jammy`，并同步替换
 `iflyelf/ubuntu:latest`、`iflyelf/ubuntu:lite` 为对应版本镜像即可（deb 版本号不变）。
