@@ -31,9 +31,11 @@ services:
       - "13306:3306"
     volumes:
       - ./data/mgr/mysql-mgr-1:/var/lib/mysql
+      # 基础配置(所有节点相同, 只读挂载)
       - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      # 可写: 入口脚本会在此生成 zz-mgr-auto.cnf
-      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      # 注意: 不挂载 conf.d。入口脚本会按节点环境变量在容器内生成
+      # /etc/mysql/conf.d/zz-mgr-auto.cnf(server_id/local_address/seeds),
+      # 若三个节点共用宿主机目录会互相覆盖, 因此保留在容器内。
       - /etc/localtime:/etc/localtime:ro
     networks:
       mgr:
@@ -66,8 +68,9 @@ services:
       - "13307:3306"
     volumes:
       - ./data/mgr/mysql-mgr-2:/var/lib/mysql
+      # 基础配置(所有节点相同, 只读挂载)
       - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      # 不挂载 conf.d(节点差异化配置由入口脚本在容器内生成, 见 mysql-mgr-1 注释)
       - /etc/localtime:/etc/localtime:ro
     networks:
       mgr:
@@ -100,8 +103,9 @@ services:
       - "13308:3306"
     volumes:
       - ./data/mgr/mysql-mgr-3:/var/lib/mysql
+      # 基础配置(所有节点相同, 只读挂载)
       - ./conf/mysql/my.cnf:/etc/mysql/my.cnf:ro
-      - ./conf/mysql/conf.d:/etc/mysql/conf.d
+      # 不挂载 conf.d(节点差异化配置由入口脚本在容器内生成, 见 mysql-mgr-1 注释)
       - /etc/localtime:/etc/localtime:ro
     networks:
       mgr:

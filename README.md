@@ -149,8 +149,9 @@ mysql -h127.0.0.1 -P3306 -uroot -p
 
 - 网络：独立 bridge 网络 `172.30.8.0/24`，固定 IP 保证 `group_replication_local_address` 稳定
 - 数据：`./data/mgr/mysql-mgr-{1,2,3}`
-- 配置：`conf/mysql/my.cnf`（基础）+ `conf/mysql/conf.d/mgr.cnf`（组复制）
-  + 运行时生成 `conf/mysql/conf.d/zz-mgr-auto.cnf`（节点差异化参数）
+- 配置：`conf/mysql/my.cnf`（基础，只读挂载）+ 镜像内 `conf/mysql/conf.d/mgr.cnf`（组复制）
+  + 入口脚本在**容器内**生成的 `/etc/mysql/conf.d/zz-mgr-auto.cnf`（节点差异化参数：
+  `server_id` / `local_address` / `group_seeds`）。该文件不落宿主机，避免三节点共用目录互相覆盖。
 
 ### 步骤
 
@@ -245,7 +246,7 @@ docker start mysql-mgr-1
 
 - `conf/mysql/my.cnf`：基础配置（客户端/服务端/InnoDB/binlog/慢查询等）
 - `conf/mysql/conf.d/mgr.cnf`：MGR 组复制（全部 `loose_` 前缀，单机部署不生效也不报错）
-- `conf/mysql/conf.d/zz-mgr-auto.cnf`：**运行时自动生成**（`server_id`/`local_address`/`seeds`），不要手工改
+- `/etc/mysql/conf.d/zz-mgr-auto.cnf`（容器内）：**运行时自动生成**（`server_id`/`local_address`/`seeds`），不要手工改
 
 ### 相对旧配置的清理（MySQL 8.4 已移除/废弃）
 
