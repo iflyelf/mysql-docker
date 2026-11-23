@@ -284,6 +284,16 @@ docker_mgr_generate_config() {
 	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} bootstrap=${bootstrap} seeds=${MYSQL_MGR_GROUP_SEEDS}"
 }
 
+# 初始化结束后清空本机 GTID: 导入时区表/初始化脚本会写入本机 server_uuid 的 GTID,
+# 这些事务不在组内, 加入 MGR 时会被拒绝("This member has more executed transactions than
+# those present in the group"), 因此在首次初始化完成后统一清空(此时尚未复制任何数据)。
+docker_mgr_reset_gtid() {
+	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+	mysql_note "MGR: 清空初始化阶段产生的 GTID (RESET BINARY LOGS AND GTIDS)"
+	docker_process_sql --database=mysql <<<"RESET BINARY LOGS AND GTIDS;" \
+		|| mysql_warn "MGR: 清空 GTID 失败, 该节点加入集群时可能被拒绝"
+}
+
 # 等待组内任意一个同伴的 33061 端口可达后再启动, 解决"节点同时启动但引导节点尚未就绪"的问题
 # (MGR 在启动时若无法联系到任何同伴, 会停在 OFFLINE, 需要重启才能重新加入)
 docker_mgr_wait_for_seeds() {
@@ -509,6 +519,9 @@ _main() {
 			docker_process_init_files /docker-entrypoint-initdb.d/*
 
 			mysql_expire_root_user
+
+			# MGR: 清空初始化产生的 GTID, 否则新成员无法加入已有集群
+			docker_mgr_reset_gtid
 
 			mysql_note "Stopping temporary server"
 			docker_temp_server_stop

@@ -183,6 +183,8 @@ docker logs -f mysql-mgr-1
 - 同时写入标记 `/var/lib/mysql/.mgr_bootstrapped`，**重启不会再引导**（避免脑裂）
 - 其他节点启动前会先探测 `MYSQL_MGR_GROUP_SEEDS` 中同伴的 33061 端口（最多 `MYSQL_MGR_WAIT_TIMEOUT` 秒），
   避免"同时启动时引导节点尚未就绪 → 成员停在 OFFLINE"
+- 首次初始化结束时执行 `RESET BINARY LOGS AND GTIDS`，清除时区表导入等初始化事务产生的本机 GTID，
+  否则加入组时会报 `This member has more executed transactions than those present in the group`
 - 若首次引导异常（例如启动即崩溃）：删除 `.mgr_bootstrapped` 后重启该节点即可重新引导；
   重建整个集群则清空三个节点数据目录后按序启动
 
@@ -282,7 +284,7 @@ docker start mysql-mgr-1
 | 连接 | `max_connections` | `10000` | k8s 参考值为 100000，容器内按内存下调 |
 | 连接 | `wait_timeout` / `interactive_timeout` | `28800` | k8s 参考值为 2880000（33 天），此处按连接池习惯收敛 |
 | 包大小 | `max_allowed_packet` | `1G` | k8s 参考值为 5G，按常规业务收敛 |
-| binlog | `binlog_format` / `binlog_row_image` | `ROW` / `FULL` | MGR 强制要求 |
+| binlog | `binlog_row_image` | `FULL` | MGR 强制要求（8.4 起 `binlog_format` 已废弃，仅支持 ROW） |
 | binlog | `binlog_checksum` | `NONE` | MGR 要求 |
 | binlog | `sync_binlog` | `1` | 崩溃不丢事务 |
 | GTID | `gtid_mode` / `enforce_gtid_consistency` | `ON` | MGR/主从基础 |
