@@ -268,16 +268,24 @@ docker_mgr_generate_config() {
 		mysql_note "MGR: 首次启动, 本次将引导新组(bootstrap=ON)"
 	fi
 
+	# 插件参数必须带 loose_ 前缀(MySQL 解析配置时插件尚未初始化),
+	# 启动时会打印一次 "unknown variable 'loose_group_replication_*'" 提示, 值仍会生效
 	cat > "$confFile" <<-EOF
 		# 由 docker-entrypoint.sh 根据环境变量自动生成, 请勿手工修改
 		[mysqld]
 		server_id = ${serverId}
-		group_replication_start_on_boot = ON
-		group_replication_bootstrap_group = ${bootstrap}
-		group_replication_group_name = '${groupName}'
-		group_replication_local_address = '${localAddr}'
-		group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
-		group_replication_single_primary_mode = ${singlePrimary}
+		loose_group_replication_start_on_boot = ON
+		loose_group_replication_bootstrap_group = ${bootstrap}
+		loose_group_replication_group_name = '${groupName}'
+		loose_group_replication_local_address = '${localAddr}'
+		loose_group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
+		loose_group_replication_single_primary_mode = ${singlePrimary}
+		loose_group_replication_enforce_update_everywhere_checks = OFF
+		loose_group_replication_exit_state_action = READ_ONLY
+		loose_group_replication_autorejoin_tries = 10
+		loose_group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
+		loose_group_replication_recovery_get_public_key = ON
+		loose_group_replication_clone_threshold = 1073741824
 	EOF
 	chmod 644 "$confFile"
 	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} bootstrap=${bootstrap} seeds=${MYSQL_MGR_GROUP_SEEDS}"

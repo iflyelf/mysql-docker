@@ -1,14 +1,14 @@
 #=================================================
-#  MGR(Group Replication)组复制配置
+#  MGR(Group Replication)基础配置
 #
-#  设计原则:
-#    - 本文件显式 plugin_load_add 组复制插件, 故参数可直接使用正式名称;
-#      若使用 loose_ 前缀, MySQL 会在插件初始化前校验并打印 "unknown variable" 告警(值仍生效)
-#    - 默认 start_on_boot = OFF, 单机/未配置集群时不会尝试加入组
-#    - 每个节点必须不同的参数(server_id / local_address / bootstrap)
-#      由容器入口脚本根据环境变量生成 /etc/mysql/conf.d/zz-mgr-auto.cnf,
-#      该文件优先级更高, 无需手工修改本文件
-#    - 集群内所有成员的 group_replication_group_name 必须完全一致
+#  重要说明:
+#   1. MySQL 在解析 my.cnf 时尚未初始化插件, 因此这里的插件参数必须使用 loose_ 前缀,
+#      否则 "--initialize" 阶段(会忽略 plugin-load 列表)会直接报 unknown variable 并失败。
+#   2. 为避免单机部署时产生大量 "unknown variable 'loose_group_replication_*'" 提示,
+#      本文件只保留插件加载与主键约束; 组复制调优参数在启用 MGR 时由入口脚本写入
+#      /etc/mysql/conf.d/zz-mgr-auto.cnf(同样使用 loose_ 前缀, 值会正常生效)。
+#   3. 每个节点必须不同的参数(server_id / local_address / bootstrap)只能由环境变量控制:
+#        MYSQL_SERVER_ID / MYSQL_MGR_LOCAL_ADDRESS / MYSQL_MGR_BOOTSTRAP
 #=================================================
 [mysqld]
 # 加载组复制插件(8.4 中 group_replication 为动态插件)
@@ -17,37 +17,31 @@ plugin_load_add = group_replication.so
 # MGR 要求: 写入的表必须有主键(避免全量重启后无法恢复)
 sql_require_primary_key = ON
 
-# 事务写集提取算法(MGR 要求 XXHASH64, 8.4 中为默认值, 无需显式设置)
-# transaction_write_set_extraction = XXHASH64
-
+#---------------------------------------------------------------------------
+# 以下参数在启用 MGR(MYSQL_MGR_GROUP_SEEDS 非空)时由入口脚本自动生成, 仅供查阅
+#---------------------------------------------------------------------------
 # 组名: 集群唯一标识(UUID), 所有成员必须一致; 新建集群可用 uuidgen 重新生成
-group_replication_group_name = 'd9b5b0c4-8f1e-11f0-9a52-0242ac110002'
-
-# 是否随服务器启动自动加入组(由入口脚本按环境变量打开)
-group_replication_start_on_boot = OFF
-# 是否引导新组(仅首个节点首次初始化时临时打开, 由入口脚本控制)
-group_replication_bootstrap_group = OFF
-
-# 成员地址与种子列表(由入口脚本按环境变量覆盖)
-# group_replication_local_address = '172.30.8.11:33061'
-# group_replication_group_seeds = '172.30.8.11:33061,172.30.8.12:33061,172.30.8.13:33061'
-
-# 单主模式(ON: 一主多从, 自动选主; OFF: 多主)
-group_replication_single_primary_mode = ON
+# loose_group_replication_group_name = 'd9b5b0c4-8f1e-11f0-9a52-0242ac110002'
+# 是否随服务器启动自动加入组
+# loose_group_replication_start_on_boot = ON
+# 是否引导新组(仅首个节点首次启动时打开, 由标记文件保证只引导一次)
+# loose_group_replication_bootstrap_group = OFF
+# 成员地址与种子列表(端口固定 33061)
+# loose_group_replication_local_address = '172.30.8.11:33061'
+# loose_group_replication_group_seeds = '172.30.8.11:33061,172.30.8.12:33061,172.30.8.13:33061'
+# 单主模式(ON: 一主多从自动选主; OFF: 多主)
+# loose_group_replication_single_primary_mode = ON
 # 多主模式下需强制校验, 单主模式保持 OFF
-group_replication_enforce_update_everywhere_checks = OFF
-
+# loose_group_replication_enforce_update_everywhere_checks = OFF
 # 被驱逐后的行为: 只读, 避免误写入造成数据分叉
-group_replication_exit_state_action = READ_ONLY
+# loose_group_replication_exit_state_action = READ_ONLY
 # 网络抖动时自动重连次数
-group_replication_autorejoin_tries = 10
+# loose_group_replication_autorejoin_tries = 10
 # 一致性级别: 主库切换期间阻塞读, 保证不读到旧数据
-group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
+# loose_group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
 # 分布式恢复使用 caching_sha2_password 时获取服务端公钥
-group_replication_recovery_get_public_key = ON
+# loose_group_replication_recovery_get_public_key = ON
 # 大于该阈值时使用 clone 插件做全量恢复(1G)
-group_replication_clone_threshold = 1073741824
-
-# 组通信白名单(8.0.22 起替换 ip_whitelist); 留空表示允许全部网段,
-# 生产环境建议按实际网段收紧, 例如 '172.30.8.0/24'
-# group_replication_ip_allowlist = '172.30.8.0/24'
+# loose_group_replication_clone_threshold = 1073741824
+# 组通信白名单(8.0.22 起替换 ip_whitelist); 生产环境建议按实际网段收紧
+# loose_group_replication_ip_allowlist = '172.30.8.0/24'
