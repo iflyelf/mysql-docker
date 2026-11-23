@@ -28,18 +28,20 @@ set -euo pipefail
 # 0. K8s 资源格式解析（8Gi/4096Mi/500m/4 → 字节 / 核数）
 # ==============================================================================
 parse_memory_to_bytes() {
-    local s="$1"
+    local s="$1" num mult
     case "$s" in
-        *Ki) echo "$(( ${s%Ki} * 1024 ))" ;;
-        *Mi) echo "$(( ${s%Mi} * 1024 * 1024 ))" ;;
-        *Gi) echo "$(( ${s%Gi} * 1024 * 1024 * 1024 ))" ;;
-        *Ti) echo "$(( ${s%Ti} * 1024 * 1024 * 1024 * 1024 ))" ;;
-        *K)  echo "$(( ${s%K} * 1000 ))" ;;
-        *M)  echo "$(( ${s%M} * 1000 * 1000 ))" ;;
-        *G)  echo "$(( ${s%G} * 1000 * 1000 * 1000 ))" ;;
-        *T)  echo "$(( ${s%T} * 1000 * 1000 * 1000 * 1000 ))" ;;
-        *)   echo "$s" ;;
+        *Ki) num="${s%Ki}"; mult=1024 ;;
+        *Mi) num="${s%Mi}"; mult=1048576 ;;
+        *Gi) num="${s%Gi}"; mult=1073741824 ;;
+        *Ti) num="${s%Ti}"; mult=1099511627776 ;;
+        *K)  num="${s%K}";  mult=1000 ;;
+        *M)  num="${s%M}";  mult=1000000 ;;
+        *G)  num="${s%G}";  mult=1000000000 ;;
+        *T)  num="${s%T}";  mult=1000000000000 ;;
+        *)   echo "$s"; return ;;
     esac
+    # 用 awk 计算以支持小数(如 1.5Gi / 2.5G)
+    awk -v n="$num" -v m="$mult" 'BEGIN { printf "%.0f", n * m }'
 }
 
 parse_cpu_to_cores() {
@@ -203,9 +205,9 @@ LOG_BUFFER_MB="$(clamp "$((BUFFER_POOL_MB / 16))" 16 256)"
 REDO_CAPACITY_MB="$(clamp "$((BUFFER_POOL_MB / 4))" 512 8192)"
 
 # ---------- 内存预算校验 ----------
-# mysqld 自身 + 连接线程栈 + 临时空间等保留约 256MB（小内存容器按 15% 折算）
-RESERVE_MB="$((MEM_MB * 15 / 100))"
-[ "$RESERVE_MB" -lt 128 ] && RESERVE_MB=128
+# mysqld 自身(代码/线程栈/performance_schema/临时空间)保留: 15% 内存, 但至少 384MB、至多 2GB
+# (低于 384MB 时 mysqld 初始化阶段自身开销就可能触发 cgroup OOM)
+RESERVE_MB="$(clamp "$((MEM_MB * 15 / 100))" 384 2048)"
 AVAIL_MB="$((MEM_MB - RESERVE_MB - LOG_BUFFER_MB))"
 [ "$AVAIL_MB" -lt 256 ] && AVAIL_MB=128
 
@@ -227,6 +229,13 @@ if [ "$((BUFFER_POOL_MB + REDO_CAPACITY_MB))" -gt "$AVAIL_MB" ]; then
     BUFFER_POOL_MB="$(clamp "$((AVAIL_MB * 3 / 4))" 128 131072)"
     REDO_CAPACITY_MB="$(clamp "$((AVAIL_MB / 4))" 64 8192)"
     REBALANCED="（已按内存预算下调：缓冲池+redo 合计不得超过 内存-保留-日志缓冲）"
+fi
+
+# 小内存提示: MySQL 实际至少需要 1.5GB 才能稳定运行(建议 2GB+)
+SMALL_MEM_HINT=""
+if [ "$MEM_MB" -lt 1536 ]; then
+    SMALL_MEM_HINT="注意: 检测到内存仅 ${MEM_MB}MB, MySQL 建议至少 2GB; 当前参数已按最小预算收敛。
+"
 fi
 
 # 宿主机回退提示: 未设置容器内存限制时, 参数按宿主机总内存计算, 需提醒用户可能的资源争抢
@@ -463,7 +472,7 @@ IO 能力(min/max)    : ${IO_CAPACITY}/${IO_CAPACITY_MAX}, 读写线程 ${IO_THR
 会话内存估算        : 典型并发 ${TYPICAL_CONN} 连接 ≈ ${SESSION_TYPICAL_MB}MB (${typical_pct}%);
                       极端全满 ${MAX_CONNECTIONS} 连接 ≈ ${SESSION_WORST_MB}MB (${worst_pct}%，实际按需分配不会全部占用)
 提示: 连接池场景可用 MYSQL_MAX_CONNECTIONS 调小; 云盘请按实际 IOPS 设置 MYSQL_IOPS
-${HOST_HINT}=======================================
+${SMALL_MEM_HINT}${HOST_HINT}=======================================
 SUMMARY
 }
 

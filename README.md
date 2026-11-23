@@ -157,6 +157,8 @@ max_connections = 512
 | `innodb_purge_threads` | CPU ÷ 2 | 2~8 |
 | `replica_parallel_workers` | CPU 核数 | 4~32 |
 
+> 资源下限：MySQL 建议容器内存 **≥ 2GB**（最低 1.5GB），低于 1.5GB 时脚本会提示内存过小。
+>
 > 内存预算保护（两层）：
 > 1. 当 `缓冲池 + redo + 日志缓冲` 超过「内存 - 保留（≥128MB）- 日志缓冲」时，脚本按 3:1 自动下调
 >    缓冲池与 redo，避免小内存容器 OOM（生成配置中会注明"已按内存预算下调"）
@@ -168,7 +170,7 @@ max_connections = 512
 
 | 环境变量 | 说明 |
 | --- | --- |
-| `MYSQL_MEMORY_LIMIT` | 手动指定内存口径，如 `8Gi` / `8192Mi` / `8589934592` |
+| `MYSQL_MEMORY_LIMIT` | 手动指定内存口径，如 `8Gi` / `1.5Gi`（支持小数）/ `8192Mi` / `8589934592` |
 | `MYSQL_CPU_LIMIT` | 手动指定 CPU 口径，如 `4` / `2.5` / `500m` |
 | `MYSQL_MAX_CONNECTIONS` | 直接指定最大连接数（覆盖自动计算） |
 | `MYSQL_IOPS` | 磁盘 IOPS 基准（默认 4000 = SSD；HDD 200，NVMe 可 10000+） |
