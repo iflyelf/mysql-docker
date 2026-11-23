@@ -213,7 +213,7 @@ RUN set -eux; \
     # 数据/运行/初始化目录
     mkdir -p "${MYSQL_DIR}" /var/run/mysqld /docker-entrypoint-initdb.d /var/log/mysql; \
     chown -R mysql:mysql "${MYSQL_DIR}" /var/run/mysqld /var/log/mysql; \
-    chmod 1777 /var/run/mysqld; \
+    chmod 755 /var/run/mysqld; \
     # 配置权限(仅 root 可写, 避免容器内进程篡改)
     chown -R root:root /etc/mysql; \
     chmod 644 /etc/mysql/my.cnf; \

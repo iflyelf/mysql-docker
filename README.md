@@ -284,6 +284,7 @@ docker start mysql-mgr-1
 | InnoDB | `innodb_redo_log_capacity` | `4G` | 替代旧 `innodb_log_file_size` |
 | InnoDB | `innodb_flush_log_at_trx_commit` | `1` | 最安全；追求吞吐可改 `2`（最多丢 1 秒） |
 | InnoDB | `innodb_flush_method` | `O_DIRECT` | 避免双缓冲 |
+| InnoDB | `innodb_numa_interleave` | `OFF` | k8s 参考值为 ON；容器默认无 `SYS_NICE` 权限会产生大量 mbind 告警，需要时用启动参数覆盖 |
 | 慢查询 | `long_query_time` / `log_queries_not_using_indexes` | `1` / `ON` | 默认开启慢日志 |
 | MGR | `group_replication_single_primary_mode` | `ON` | 单主自动选主 |
 | MGR | `group_replication_exit_state_action` | `READ_ONLY` | 被驱逐后只读，防数据分叉 |
