@@ -3,9 +3,10 @@
 #
 #  首次部署:
 #    1) 三个节点都会各自初始化数据目录并创建账号
-#    2) mysql-mgr-1 的 MYSQL_MGR_BOOTSTRAP=1 会在初始化完成后引导新组
-#       (引导成功后在数据目录写入 .mgr_bootstrapped 标记, 后续重启不会重复引导, 避免脑裂)
-#    3) mysql-mgr-2 / mysql-mgr-3 启动后通过 group_replication_start_on_boot 自动加入组
+#    2) mysql-mgr-1 的 MYSQL_MGR_BOOTSTRAP=1 会在首次启动时由正式 mysqld 引导新组,
+#       并在数据目录写入 .mgr_bootstrapped 标记(后续重启不再引导, 避免脑裂)
+#    3) mysql-mgr-2 / mysql-mgr-3 启动前先等待同伴 33061 可达, 再通过
+#       group_replication_start_on_boot 自动加入组
 #
 #  启动: docker compose -f docker-compose-mgr.yml up -d
 #  查看: docker exec -it mysql-mgr-1 mysql -uroot -p -e \

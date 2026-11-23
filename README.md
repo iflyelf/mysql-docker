@@ -171,14 +171,20 @@ docker logs -f mysql-mgr-1
 首次启动日志关键行：
 
 ```
-[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.30.8.11:33061 seeds=...
+[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.30.8.11:33061 bootstrap=ON seeds=...
 [Entrypoint]: MGR: 配置分布式恢复通道 (repl)
-[Entrypoint]: MGR: 首次引导组复制 (group_replication_bootstrap_group=ON)
-[Entrypoint]: MGR: 引导完成, 后续启动将自动加入组
+[Entrypoint]: MGR: 首次启动, 本次将引导新组(bootstrap=ON)
 ```
 
-引导成功后会写入标记文件 `/var/lib/mysql/.mgr_bootstrapped`，
-**重启不会重复引导**（避免脑裂）；若需重建集群，删除数据目录后重新启动即可。
+引导逻辑：
+
+- `MYSQL_MGR_BOOTSTRAP=1` 且数据目录中无标记文件时，入口脚本生成 `bootstrap=ON` 的配置，
+  **由正式的 mysqld 进程直接引导新组并持续在线**（不会先起临时服务器再重启，避免重启瞬时无同伴可加入）
+- 同时写入标记 `/var/lib/mysql/.mgr_bootstrapped`，**重启不会再引导**（避免脑裂）
+- 其他节点启动前会先探测 `MYSQL_MGR_GROUP_SEEDS` 中同伴的 33061 端口（最多 `MYSQL_MGR_WAIT_TIMEOUT` 秒），
+  避免"同时启动时引导节点尚未就绪 → 成员停在 OFFLINE"
+- 若首次引导异常（例如启动即崩溃）：删除 `.mgr_bootstrapped` 后重启该节点即可重新引导；
+  重建整个集群则清空三个节点数据目录后按序启动
 
 ### 验证
 
@@ -330,6 +336,7 @@ docker start mysql-mgr-1
 | `MYSQL_MGR_GROUP_NAME` | 内置 UUID | 组名，集群内一致；新建集群建议用 `uuidgen` 重新生成 |
 | `MYSQL_MGR_BOOTSTRAP` | `0` | `1`=首次初始化时引导新组（仅首个节点首次启动） |
 | `MYSQL_MGR_SINGLE_PRIMARY` | `ON` | `ON`=单主，`OFF`=多主 |
+| `MYSQL_MGR_WAIT_TIMEOUT` | `180` | 非引导节点等待同伴 33061 可达的最长秒数 |
 
 > 注意：MySQL 8.4 起 `mysql_native_password` 默认禁用，复制账号统一使用 `caching_sha2_password`，
 > 配合 `group_replication_recovery_get_public_key=ON` 完成 MGR 分布式恢复认证。

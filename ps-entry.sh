@@ -240,8 +240,11 @@ docker_setup_env() {
 #   MYSQL_MGR_BOOTSTRAP    1 = 首次初始化时引导新组(仅首个节点首次启动使用)
 #   MYSQL_MGR_SINGLE_PRIMARY  ON/OFF，默认 ON(单主)
 # 根据环境变量生成 MGR 动态配置(必须早于配置检查执行)
+# 说明: 只有 root 身份才生成(容器默认以 root 进入入口脚本, 初始化完成后才 gosu 降权),
+#       避免降权后重复执行把 bootstrap 参数覆盖掉。
 docker_mgr_generate_config() {
 	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+	[ "$(id -u)" = "0" ] || return 0
 
 	local confDir='/etc/mysql/conf.d'
 	local confFile="${confDir}/zz-mgr-auto.cnf"
@@ -254,19 +257,66 @@ docker_mgr_generate_config() {
 	local localAddr="${MYSQL_MGR_LOCAL_ADDRESS:-$(hostname):33061}"
 	local groupName="${MYSQL_MGR_GROUP_NAME:-d9b5b0c4-8f1e-11f0-9a52-0242ac110002}"
 	local singlePrimary="${MYSQL_MGR_SINGLE_PRIMARY:-ON}"
+	local dataDir="${MYSQL_DATA:-/var/lib/mysql}"
+	local bootstrap='OFF'
+
+	# 仅新数据目录的首次启动允许引导:
+	#   引导标记写在数据目录中, 引导成功后重启不会再引导, 避免脑裂
+	if [ "${MYSQL_MGR_BOOTSTRAP:-0}" = "1" ] && [ ! -f "${dataDir}/.mgr_bootstrapped" ]; then
+		bootstrap='ON'
+		# 先落标记: 保证"引导只发生一次"; 若引导过程异常, 删除该文件后重启可重试
+		touch "${dataDir}/.mgr_bootstrapped"
+		mysql_note "MGR: 首次启动, 本次将引导新组(bootstrap=ON)"
+	fi
 
 	cat > "$confFile" <<-EOF
 		# 由 docker-entrypoint.sh 根据环境变量自动生成, 请勿手工修改
 		[mysqld]
 		server_id = ${serverId}
 		loose_group_replication_start_on_boot = ON
+		loose_group_replication_bootstrap_group = ${bootstrap}
 		loose_group_replication_group_name = '${groupName}'
 		loose_group_replication_local_address = '${localAddr}'
 		loose_group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
 		loose_group_replication_single_primary_mode = ${singlePrimary}
 	EOF
 	chmod 644 "$confFile"
-	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} seeds=${MYSQL_MGR_GROUP_SEEDS}"
+	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} bootstrap=${bootstrap} seeds=${MYSQL_MGR_GROUP_SEEDS}"
+}
+
+# 等待组内任意一个同伴的 33061 端口可达后再启动, 解决"节点同时启动但引导节点尚未就绪"的问题
+# (MGR 在启动时若无法联系到任何同伴, 会停在 OFFLINE, 需要重启才能重新加入)
+docker_mgr_wait_for_seeds() {
+	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
+	[ "${MYSQL_MGR_BOOTSTRAP:-0}" = "1" ] && return 0
+
+	local timeout="${MYSQL_MGR_WAIT_TIMEOUT:-180}"
+	local localAddr="${MYSQL_MGR_LOCAL_ADDRESS:-$(hostname):33061}"
+	local waited=0 addr host port seed
+	local seeds=()
+
+	IFS=',' read -r -a seeds <<< "${MYSQL_MGR_GROUP_SEEDS}"
+	mysql_note "MGR: 等待组内同伴就绪(最多 ${timeout}s): ${MYSQL_MGR_GROUP_SEEDS}"
+	while [ "$waited" -lt "$timeout" ]; do
+		for seed in "${seeds[@]}"; do
+			addr="${seed//[[:space:]]/}"
+			[ -n "$addr" ] || continue
+			[ "$addr" = "$localAddr" ] && continue
+			host="${addr%:*}"
+			port="${addr##*:}"
+			if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+				mysql_note "MGR: 同伴 ${addr} 已可达, 继续启动"
+				return 0
+			fi
+		done
+		sleep 5
+		waited=$((waited + 5))
+		if [ $((waited % 30)) -eq 0 ]; then
+			mysql_note "MGR: 仍在等待同伴 (${waited}/${timeout}s)"
+		fi
+	done
+	mysql_warn "MGR: 等待同伴超时(${timeout}s), 继续启动; 节点可能暂时 OFFLINE, 待同伴恢复后重启本节点即可重新加入"
+	return 0
 }
 
 # 配置 MGR 分布式恢复(组复制)通道账号，需要在临时服务器中执行一次并持久化
@@ -285,35 +335,6 @@ docker_mgr_setup_recovery() {
 			FOR CHANNEL 'group_replication_recovery';
 	EOSQL
 }
-
-# 首次初始化时引导 MGR 组(仅 MYSQL_MGR_BOOTSTRAP=1 且数据目录中无引导标记时执行)
-docker_mgr_bootstrap() {
-	[ -n "${MYSQL_MGR_GROUP_SEEDS:-}" ] || return 0
-	[ "${MYSQL_MGR_BOOTSTRAP:-0}" = "1" ] || return 0
-	if [ -f "$DATADIR/.mgr_bootstrapped" ]; then
-		mysql_note "MGR: 已引导过该组, 跳过 bootstrap(避免脑裂)"
-		return 0
-	fi
-
-	mysql_note "MGR: 首次引导组复制 (group_replication_bootstrap_group=ON)"
-	# 注意: 不使用 --skip-networking, MGR 需要正常监听/绑定通信端口;
-	#       start_on_boot 关闭, 由下面显式 bootstrap, 避免与自动入组冲突
-	"$@" --daemonize --socket="${SOCKET}" --loose-group_replication_start_on_boot=OFF \
-		|| mysql_error "MGR bootstrap: 临时服务器启动失败"
-	docker_process_sql --database=mysql <<-EOSQL
-		SET GLOBAL group_replication_bootstrap_group=ON;
-		START GROUP_REPLICATION;
-		SET GLOBAL group_replication_bootstrap_group=OFF;
-	EOSQL
-	docker_process_sql --database=mysql <<-EOSQL
-		SELECT MEMBER_HOST, MEMBER_PORT, MEMBER_STATE, MEMBER_ROLE
-		FROM performance_schema.replication_group_members;
-	EOSQL
-	docker_temp_server_stop
-	touch "$DATADIR/.mgr_bootstrapped"
-	mysql_note "MGR: 引导完成, 后续启动将自动加入组"
-}
-
 
 # Execute sql script, passed via stdin
 # usage: docker_process_sql [--dont-use-mysql-root-password] [mysql-cli-args]
@@ -500,8 +521,8 @@ _main() {
 			mysql_socket_fix
 		fi
 
-		# 首次初始化时按需引导 MGR 组
-		docker_mgr_bootstrap "$@"
+		# 等待组内同伴就绪(引导节点立即启动; 其他节点避免因同伴未就绪而停在 OFFLINE)
+		docker_mgr_wait_for_seeds
 	fi
 	exec "$@"
 }
