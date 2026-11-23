@@ -60,8 +60,8 @@ RUN set -eux; \
             wget -q -c --tries=10 --timeout=60 -O "$2" "$1"; \
         fi; \
     }; \
-    # 注意: /bin/sh(dash) 不支持 ${var//x/y}, 统一用 tr 生成仓库代号(8.4 => 84)
-    repoSeries="$(echo "${MYSQL_SERIES}" | tr '.' '-')"; \
+    # 注意: /bin/sh(dash) 不支持 ${var//x/y}; 仓库代号规则为去掉小数点(8.4 => 84)
+    repoSeries="$(echo "${MYSQL_SERIES}" | tr -d '.')"; \
     repoBase="https://repo.percona.com/ps-${repoSeries}-lts/apt/pool/main/p/percona-server"; \
     for pkg in common client server; do \
         debName="percona-server-${pkg}_${MYSQL_VERSION}-1.${PERCONA_DISTRO}_${TARGETARCH}.deb"; \
