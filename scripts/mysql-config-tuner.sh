@@ -129,12 +129,24 @@ detect_cpu_count() {
 # ==============================================================================
 # 3. 采集资源（内存 / CPU / 磁盘基准 IOPS）
 # ==============================================================================
+HOST_FALLBACK=0
+HOST_AVAIL_MB=0
 if [ -n "${MYSQL_MEMORY_LIMIT:-}" ]; then
     MEM_BYTES="$(parse_memory_to_bytes "${MYSQL_MEMORY_LIMIT}")"
     MEM_SOURCE="手动指定 MYSQL_MEMORY_LIMIT=${MYSQL_MEMORY_LIMIT}"
 else
+    # 判断是否真的探测到了 cgroup 限制(容器未设置 --memory 时会回退到宿主机 /proc/meminfo)
+    if { [ -f /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != "max" ]; } || \
+       [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        MEM_SOURCE="自动探测(cgroup)"
+    else
+        MEM_SOURCE="自动探测(宿主机总内存: 未设置容器内存限制)"
+        HOST_FALLBACK=1
+    fi
     MEM_BYTES="$(detect_memory_bytes)"
-    MEM_SOURCE="自动探测(cgroup/宿主机)"
+    if [ "$HOST_FALLBACK" = "1" ]; then
+        HOST_AVAIL_MB="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+    fi
 fi
 
 if [ -n "${MYSQL_CPU_LIMIT:-}" ]; then
@@ -197,12 +209,32 @@ RESERVE_MB="$((MEM_MB * 15 / 100))"
 AVAIL_MB="$((MEM_MB - RESERVE_MB - LOG_BUFFER_MB))"
 [ "$AVAIL_MB" -lt 256 ] && AVAIL_MB=128
 
+# 宿主机回退场景: 若宿主当前可用内存明显低于计算预算, 按可用内存的 85% 再收敛一次,
+# 避免与同机其它容器/业务争抢导致 OOM(专用数据库主机建议仍显式设置 --memory 或 MYSQL_MEMORY_LIMIT)
+HOST_CAPPED=""
+if [ "$HOST_FALLBACK" = "1" ] && [ "$HOST_AVAIL_MB" -gt 0 ]; then
+    local_budget="$((MEM_MB - RESERVE_MB - LOG_BUFFER_MB))"
+    host_budget="$((HOST_AVAIL_MB * 85 / 100 - RESERVE_MB - LOG_BUFFER_MB))"
+    if [ "$host_budget" -gt 0 ] && [ "$host_budget" -lt "$local_budget" ]; then
+        AVAIL_MB="$host_budget"
+        HOST_CAPPED="（宿主可用内存 ${HOST_AVAIL_MB}MB 低于按总内存计算的预算, 已按其 85% 下调）"
+    fi
+fi
+
 REBALANCED=""
 if [ "$((BUFFER_POOL_MB + REDO_CAPACITY_MB))" -gt "$AVAIL_MB" ]; then
     # 缓冲池与 redo 合计超出可用内存时按 3:1 重新分配，避免小内存容器 OOM
     BUFFER_POOL_MB="$(clamp "$((AVAIL_MB * 3 / 4))" 128 131072)"
     REDO_CAPACITY_MB="$(clamp "$((AVAIL_MB / 4))" 64 8192)"
     REBALANCED="（已按内存预算下调：缓冲池+redo 合计不得超过 内存-保留-日志缓冲）"
+fi
+
+# 宿主机回退提示: 未设置容器内存限制时, 参数按宿主机总内存计算, 需提醒用户可能的资源争抢
+HOST_HINT=""
+if [ "$HOST_FALLBACK" = "1" ] && [ "$HOST_AVAIL_MB" -gt 0 ]; then
+    HOST_HINT="注意: 未设置容器内存限制, 按宿主机总内存 ${MEM_MB}MB 计算(当前宿主可用 ${HOST_AVAIL_MB}MB)。
+      建议显式限制容器内存(docker run --memory=8g / compose mem_limit)或设置 MYSQL_MEMORY_LIMIT。
+"
 fi
 
 # innodb_buffer_pool_instances = 每 1GiB 缓冲池 1 个实例（限制 1~16）
@@ -278,6 +310,7 @@ FORMAT="${1:-conf}"
 
 RESOURCE_LINE="内存 ${MEM_MB}MB[${MEM_SOURCE}] / CPU ${CPU_COUNT} 核[${CPU_SOURCE}] / 磁盘基准 IOPS ${IOPS}"
 
+
 emit_conf() {
 cat <<CONF
 ###############################################################################
@@ -306,7 +339,7 @@ back_log = ${BACK_LOG}
 #------------------------------------------------------------------------------
 # InnoDB 内存
 #------------------------------------------------------------------------------
-# 缓冲池 = 内存 × 70% = ${MEM_MB}MB × 70% → ${BUFFER_POOL_MB}MB（限制 128MB~128GB）${REBALANCED}
+# 缓冲池 = 内存 × 70% = ${MEM_MB}MB × 70% → ${BUFFER_POOL_MB}MB（限制 128MB~128GB）${REBALANCED}${HOST_CAPPED}
 #   InnoDB 最热数据与索引缓存，是决定性能的最关键参数
 innodb_buffer_pool_size = ${BUFFER_POOL_MB}M
 
@@ -317,7 +350,7 @@ innodb_buffer_pool_instances = ${BUFFER_POOL_INSTANCES}
 # 缓冲池预热保留比例 = ${BP_DUMP_PCT}%（重启后只恢复最热的 1/4 页面，缩短启动时间）
 innodb_buffer_pool_dump_pct = ${BP_DUMP_PCT}
 
-# Redo 容量 = 缓冲池 × 25% = ${BUFFER_POOL_MB}MB × 25% → ${REDO_CAPACITY_MB}MB（限制 64MB~8GB）${REBALANCED}
+# Redo 容量 = 缓冲池 × 25% = ${BUFFER_POOL_MB}MB × 25% → ${REDO_CAPACITY_MB}MB（限制 64MB~8GB）${REBALANCED}${HOST_CAPPED}
 #   8.4 用 innodb_redo_log_capacity 统一管理（替代已移除的 innodb_log_file_size
 #   与 innodb_log_files_in_group），建议 ≥ 1 小时写入量
 innodb_redo_log_capacity = ${REDO_CAPACITY_MB}M
@@ -412,7 +445,7 @@ emit_summary() {
     local budget_pct="$(((BUFFER_POOL_MB + REDO_CAPACITY_MB + LOG_BUFFER_MB) * 100 / MEM_MB))"
 cat <<SUMMARY
 ===== MySQL 自动调优资源与关键参数 =====
-内存                : ${MEM_MB}MB (${MEM_SOURCE})
+内存                : ${MEM_MB}MB (${MEM_SOURCE})${HOST_CAPPED}
 CPU                 : ${CPU_COUNT} 核 (${CPU_SOURCE})
 磁盘基准 IOPS       : ${IOPS} (环境变量 MYSQL_IOPS 可覆盖)
 max_connections     : ${MAX_CONNECTIONS} (${CONN_SOURCE})
@@ -430,7 +463,7 @@ IO 能力(min/max)    : ${IO_CAPACITY}/${IO_CAPACITY_MAX}, 读写线程 ${IO_THR
 会话内存估算        : 典型并发 ${TYPICAL_CONN} 连接 ≈ ${SESSION_TYPICAL_MB}MB (${typical_pct}%);
                       极端全满 ${MAX_CONNECTIONS} 连接 ≈ ${SESSION_WORST_MB}MB (${worst_pct}%，实际按需分配不会全部占用)
 提示: 连接池场景可用 MYSQL_MAX_CONNECTIONS 调小; 云盘请按实际 IOPS 设置 MYSQL_IOPS
-=======================================
+${HOST_HINT}=======================================
 SUMMARY
 }
 
