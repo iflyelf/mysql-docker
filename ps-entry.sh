@@ -139,9 +139,7 @@ docker_temp_server_start() {
 		fi
 	else
 		# For 5.7+ the server is ready for use as soon as startup command unblocks
-		# 初始化/临时启动阶段必须关闭 MGR 自动入组, 否则空实例会尝试加入已有集群
-		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}" \
-			--loose-group_replication_start_on_boot=OFF; then
+		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}"; then
 			mysql_error "Unable to start server."
 		fi
 	fi
@@ -239,7 +237,8 @@ docker_setup_env() {
 #   MYSQL_MGR_GROUP_NAME   组名(UUID, 集群内一致)
 #   MYSQL_MGR_BOOTSTRAP    1 = 首次初始化时引导新组(仅首个节点首次启动使用)
 #   MYSQL_MGR_SINGLE_PRIMARY  ON/OFF，默认 ON(单主)
-# 根据环境变量生成 MGR 动态配置(必须早于配置检查执行)
+# 根据环境变量生成 MGR 动态配置(在正式启动 mysqld 之前调用;
+# 初始化阶段的临时服务器不会读取到该文件, 因此不会误加入已有集群)
 # 说明: 只有 root 身份才生成(容器默认以 root 进入入口脚本, 初始化完成后才 gosu 降权),
 #       避免降权后重复执行把 bootstrap 参数覆盖掉。
 docker_mgr_generate_config() {
@@ -273,12 +272,12 @@ docker_mgr_generate_config() {
 		# 由 docker-entrypoint.sh 根据环境变量自动生成, 请勿手工修改
 		[mysqld]
 		server_id = ${serverId}
-		loose_group_replication_start_on_boot = ON
-		loose_group_replication_bootstrap_group = ${bootstrap}
-		loose_group_replication_group_name = '${groupName}'
-		loose_group_replication_local_address = '${localAddr}'
-		loose_group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
-		loose_group_replication_single_primary_mode = ${singlePrimary}
+		group_replication_start_on_boot = ON
+		group_replication_bootstrap_group = ${bootstrap}
+		group_replication_group_name = '${groupName}'
+		group_replication_local_address = '${localAddr}'
+		group_replication_group_seeds = '${MYSQL_MGR_GROUP_SEEDS}'
+		group_replication_single_primary_mode = ${singlePrimary}
 	EOF
 	chmod 644 "$confFile"
 	mysql_note "MGR 配置已生成: server_id=${serverId} local_address=${localAddr} bootstrap=${bootstrap} seeds=${MYSQL_MGR_GROUP_SEEDS}"
@@ -486,8 +485,6 @@ _main() {
 	if [ "$1" = 'mysqld' ] && ! _mysql_want_help "$@"; then
 		mysql_note "Entrypoint script for MySQL Server ${MYSQL_VERSION} started."
 
-		# 生成 MGR 动态配置(必须在配置检查之前)
-		docker_mgr_generate_config
 		mysql_check_config "$@"
 		# Load various environment variables
 		docker_setup_env "$@"
@@ -534,6 +531,8 @@ _main() {
 			mysql_socket_fix
 		fi
 
+		# MGR 动态配置(节点差异化参数)在正式启动前生成
+		docker_mgr_generate_config
 		# 等待组内同伴就绪(引导节点立即启动; 其他节点避免因同伴未就绪而停在 OFFLINE)
 		docker_mgr_wait_for_seeds
 	fi

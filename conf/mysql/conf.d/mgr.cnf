@@ -2,7 +2,8 @@
 #  MGR(Group Replication)组复制配置
 #
 #  设计原则:
-#    - 全部参数使用 loose_ 前缀, 单机部署(不加载组复制)时不会因参数无法识别而启动失败
+#    - 本文件显式 plugin_load_add 组复制插件, 故参数可直接使用正式名称;
+#      若使用 loose_ 前缀, MySQL 会在插件初始化前校验并打印 "unknown variable" 告警(值仍生效)
 #    - 默认 start_on_boot = OFF, 单机/未配置集群时不会尝试加入组
 #    - 每个节点必须不同的参数(server_id / local_address / bootstrap)
 #      由容器入口脚本根据环境变量生成 /etc/mysql/conf.d/zz-mgr-auto.cnf,
@@ -20,33 +21,33 @@ sql_require_primary_key = ON
 # transaction_write_set_extraction = XXHASH64
 
 # 组名: 集群唯一标识(UUID), 所有成员必须一致; 新建集群可用 uuidgen 重新生成
-loose_group_replication_group_name = 'd9b5b0c4-8f1e-11f0-9a52-0242ac110002'
+group_replication_group_name = 'd9b5b0c4-8f1e-11f0-9a52-0242ac110002'
 
 # 是否随服务器启动自动加入组(由入口脚本按环境变量打开)
-loose_group_replication_start_on_boot = OFF
+group_replication_start_on_boot = OFF
 # 是否引导新组(仅首个节点首次初始化时临时打开, 由入口脚本控制)
-loose_group_replication_bootstrap_group = OFF
+group_replication_bootstrap_group = OFF
 
 # 成员地址与种子列表(由入口脚本按环境变量覆盖)
-# loose_group_replication_local_address = '172.30.8.11:33061'
-# loose_group_replication_group_seeds = '172.30.8.11:33061,172.30.8.12:33061,172.30.8.13:33061'
+# group_replication_local_address = '172.30.8.11:33061'
+# group_replication_group_seeds = '172.30.8.11:33061,172.30.8.12:33061,172.30.8.13:33061'
 
 # 单主模式(ON: 一主多从, 自动选主; OFF: 多主)
-loose_group_replication_single_primary_mode = ON
+group_replication_single_primary_mode = ON
 # 多主模式下需强制校验, 单主模式保持 OFF
-loose_group_replication_enforce_update_everywhere_checks = OFF
+group_replication_enforce_update_everywhere_checks = OFF
 
 # 被驱逐后的行为: 只读, 避免误写入造成数据分叉
-loose_group_replication_exit_state_action = READ_ONLY
+group_replication_exit_state_action = READ_ONLY
 # 网络抖动时自动重连次数
-loose_group_replication_autorejoin_tries = 10
+group_replication_autorejoin_tries = 10
 # 一致性级别: 主库切换期间阻塞读, 保证不读到旧数据
-loose_group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
+group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
 # 分布式恢复使用 caching_sha2_password 时获取服务端公钥
-loose_group_replication_recovery_get_public_key = ON
+group_replication_recovery_get_public_key = ON
 # 大于该阈值时使用 clone 插件做全量恢复(1G)
-loose_group_replication_clone_threshold = 1073741824
+group_replication_clone_threshold = 1073741824
 
 # 组通信白名单(8.0.22 起替换 ip_whitelist); 留空表示允许全部网段,
 # 生产环境建议按实际网段收紧, 例如 '172.30.8.0/24'
-# loose_group_replication_ip_allowlist = '172.30.8.0/24'
+# group_replication_ip_allowlist = '172.30.8.0/24'
