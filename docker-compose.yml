@@ -4,7 +4,11 @@
 #  定时备份(可选): docker compose --profile backup up -d
 #
 #  说明:
-#   - 网络采用固定 IPv4 + IPv6(与 autosys-docker 保持一致), 便于固定地址访问
+#   - 网络为 mysql 专用(名称以组件名 mysql_ 开头), 固定 IPv4 + IPv6, 便于固定地址访问
+#     网段规划(在 172.21.0.0/24 + fe99::/64 规划内避让已占用网段):
+#       php-docker 已占用 172.21.0.0/24 + fd98::/64, pg-docker 占用 172.22.x + fe9a
+#       mysql_net     = 172.21.4.0/24 + fe99:4::/64  (单机)
+#       mysql_mgr_net = 172.21.5.0/24 + fe99:5::/64  (3 节点集群)
 #   - MySQL 默认仅监听 IPv4(bind_address=0.0.0.0), IPv6 地址保留待用
 #   - 未开启 privileged / cap_add: MySQL 正常运行不需要内核特权;
 #     如需 NUMA 绑核可单独加 cap_add: [SYS_NICE](并在 my.cnf 打开 innodb_numa_interleave)
@@ -57,9 +61,9 @@ services:
       # MYSQL_AUTO_TUNE: "1"        # 0 = 关闭自动调优, 使用 my.cnf 内置默认值
     # 配置容器连接的网络
     networks:
-      app_net:
-        ipv4_address: 172.186.0.2
-        ipv6_address: 2066::2
+      mysql_net:
+        ipv4_address: 172.21.4.2
+        ipv6_address: fe99:4::2
     # 暴露端口信息
     ports:
     - "3306:3306"     # MySQL 协议
@@ -88,6 +92,8 @@ services:
   #   - 数据目录以只读方式挂载: xtrabackup 直接读取数据文件, 通过 TCP 连接实例
   # ---------------------------------------------------------------------------
   backup:
+    # 仅在显式启用 profile 时启动(docker compose --profile backup up -d)
+    profiles: ["backup"]
     # 备份容器无需交互
     tty: false
     stdin_open: false
@@ -130,9 +136,9 @@ services:
       XB_BACKUP_TIME: "03:00"
     # 配置容器连接的网络
     networks:
-      app_net:
-        ipv4_address: 172.186.0.3
-        ipv6_address: 2066::3
+      mysql_net:
+        ipv4_address: 172.21.4.3
+        ipv6_address: fe99:4::3
     # 解决容器的依赖(等主库健康后再备份)
     depends_on:
       mysql:
@@ -145,11 +151,12 @@ services:
           hard: 65535
 
 networks:
-  app_net:
+  # 网络名称/桥名以组件名 mysql_ 开头, 网段避让 php/pg 等已占用段
+  mysql_net:
     driver: bridge
     enable_ipv6: true
     driver_opts:
-      com.docker.network.bridge.name: mysql_app_net
+      com.docker.network.bridge.name: mysql_net
       com.docker.network.bridge.enable_icc: "true"
       com.docker.network.bridge.enable_ip_forwarding: "true"
       com.docker.network.bridge.enable_ip_masquerade: "true"
@@ -159,7 +166,7 @@ networks:
     ipam:
       driver: default
       config:
-      - subnet: 172.186.0.0/24
-        gateway: 172.186.0.1
-      - subnet: 2066::/64
-        gateway: 2066::1
+      - subnet: 172.21.4.0/24
+        gateway: 172.21.4.1
+      - subnet: fe99:4::/64
+        gateway: fe99:4::1

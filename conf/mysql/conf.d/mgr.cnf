@@ -32,8 +32,8 @@ loose_group_replication_start_on_boot = OFF
 # 是否引导新组(仅首个节点首次启动时打开, 由标记文件保证只引导一次)
 # loose_group_replication_bootstrap_group = OFF
 # 成员地址与种子列表(端口固定 33061)
-# loose_group_replication_local_address = '172.30.8.11:33061'
-# loose_group_replication_group_seeds = '172.30.8.11:33061,172.30.8.12:33061,172.30.8.13:33061'
+# loose_group_replication_local_address = '172.21.5.11:33061'
+# loose_group_replication_group_seeds = '172.21.5.11:33061,172.21.5.12:33061,172.21.5.13:33061'
 # 单主模式(ON: 一主多从自动选主; OFF: 多主)
 # loose_group_replication_single_primary_mode = ON
 # 多主模式下需强制校验, 单主模式保持 OFF
@@ -49,4 +49,4 @@ loose_group_replication_start_on_boot = OFF
 # 大于该阈值时使用 clone 插件做全量恢复(1G)
 # loose_group_replication_clone_threshold = 1073741824
 # 组通信白名单(8.0.22 起替换 ip_whitelist); 生产环境建议按实际网段收紧
-# loose_group_replication_ip_allowlist = '172.30.8.0/24'
+# loose_group_replication_ip_allowlist = '172.21.5.0/24'

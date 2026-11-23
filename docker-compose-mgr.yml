@@ -10,8 +10,11 @@
 #    3) mysql-mgr-2 / mysql-mgr-3 启动前先等待同伴 33061 可达, 再自动加入组
 #
 #  说明:
-#   - 网络采用固定 IPv4 + IPv6(与 autosys-docker 保持一致), MGR 通信地址需与固定 IP 一致
-#   - 节点 IP: 172.186.1.11 / .12 / .13, 与 .env_vars/.env_db_mgr 的 MYSQL_MGR_GROUP_SEEDS 对应
+#   - 网络为 mysql 专用(名称以组件名 mysql_ 开头), 固定 IPv4 + IPv6, MGR 通信地址需与固定 IP 一致
+#     网段规划(避让 php 的 172.21.0.0/24、pg 的 172.22.x):
+#       mysql_mgr_net = 172.21.5.0/24 + fe99:5::/64 (集群)
+#       mysql_net     = 172.21.4.0/24 + fe99:4::/64 (单机, 两套栈可同时运行)
+#   - 节点 IP: 172.21.5.11 / .12 / .13, 与 .env_vars/.env_db_mgr 的 MYSQL_MGR_GROUP_SEEDS 对应
 #   - 未开启 privileged / cap_add: MySQL 正常运行不需要内核特权
 #=================================================
 name: mysql-mgr
@@ -54,7 +57,7 @@ services:
       # 节点专属: server_id 必须唯一
       MYSQL_SERVER_ID: "1"
       # 节点专属: MGR 通信地址(与 networks 中的固定 IP 一致)
-      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.11:33061
+      MYSQL_MGR_LOCAL_ADDRESS: 172.21.5.11:33061
       # 仅首个节点首次初始化时置 1
       MYSQL_MGR_BOOTSTRAP: "1"
       # 自动调优(默认开启): 按容器 CPU/内存计算容量类参数
@@ -63,9 +66,9 @@ services:
       # MYSQL_IOPS: "4000"
     # 配置容器连接的网络
     networks:
-      mgr_net:
-        ipv4_address: 172.186.1.11
-        ipv6_address: 2066:1::11
+      mysql_mgr_net:
+        ipv4_address: 172.21.5.11
+        ipv6_address: fe99:5::11
     # 暴露端口信息(宿主机可用 13306 连接本节点)
     ports:
     - "13306:3306"
@@ -105,12 +108,12 @@ services:
     environment:
       TZ: Asia/Shanghai
       MYSQL_SERVER_ID: "2"
-      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.12:33061
+      MYSQL_MGR_LOCAL_ADDRESS: 172.21.5.12:33061
       MYSQL_MGR_BOOTSTRAP: "0"
     networks:
-      mgr_net:
-        ipv4_address: 172.186.1.12
-        ipv6_address: 2066:1::12
+      mysql_mgr_net:
+        ipv4_address: 172.21.5.12
+        ipv6_address: fe99:5::12
     ports:
     - "13307:3306"
     ulimits:
@@ -147,12 +150,12 @@ services:
     environment:
       TZ: Asia/Shanghai
       MYSQL_SERVER_ID: "3"
-      MYSQL_MGR_LOCAL_ADDRESS: 172.186.1.13:33061
+      MYSQL_MGR_LOCAL_ADDRESS: 172.21.5.13:33061
       MYSQL_MGR_BOOTSTRAP: "0"
     networks:
-      mgr_net:
-        ipv4_address: 172.186.1.13
-        ipv6_address: 2066:1::13
+      mysql_mgr_net:
+        ipv4_address: 172.21.5.13
+        ipv6_address: fe99:5::13
     ports:
     - "13308:3306"
     ulimits:
@@ -176,6 +179,8 @@ services:
   #   - 使用官方 percona/percona-xtrabackup:8.4 镜像, 备份写入宿主机 ./backup
   # ---------------------------------------------------------------------------
   backup:
+    # 仅在显式启用 profile 时启动(docker compose -f docker-compose-mgr.yml --profile backup up -d)
+    profiles: ["backup"]
     tty: false
     stdin_open: false
     hostname: mysql-mgr-backup
@@ -202,9 +207,9 @@ services:
       XB_RETENTION_DAYS: "7"
       XB_BACKUP_TIME: "03:00"
     networks:
-      mgr_net:
-        ipv4_address: 172.186.1.14
-        ipv6_address: 2066:1::14
+      mysql_mgr_net:
+        ipv4_address: 172.21.5.14
+        ipv6_address: fe99:5::14
     depends_on:
       mysql-mgr-2:
         condition: service_healthy
@@ -215,7 +220,8 @@ services:
           hard: 65535
 
 networks:
-  mgr_net:
+  # 网络名称/桥名以组件名 mysql_ 开头, 与单机栈(mysql_net)网段不冲突
+  mysql_mgr_net:
     driver: bridge
     enable_ipv6: true
     driver_opts:
@@ -229,7 +235,7 @@ networks:
     ipam:
       driver: default
       config:
-      - subnet: 172.186.1.0/24
-        gateway: 172.186.1.1
-      - subnet: 2066:1::/64
-        gateway: 2066:1::1
+      - subnet: 172.21.5.0/24
+        gateway: 172.21.5.1
+      - subnet: fe99:5::/64
+        gateway: fe99:5::1

@@ -18,6 +18,7 @@
 - [多阶段构建](#多阶段构建)
 - [CPU / 内存自动调优](#cpu--内存自动调优)
 - [快速开始（单机）](#快速开始单机)
+- [网络规划](#网络规划)
 - [MGR 3 节点集群部署](#mgr-3-节点集群部署)
 - [my.cnf 参数说明](#mycnf-参数说明)
 - [环境变量](#环境变量)
@@ -191,7 +192,7 @@ cd /xiaonuo/workspace/docker/mysql-docker
 cp .env_vars/.env_db_mysql .env_vars/.env_db_mysql.local   # 可选
 vi .env_vars/.env_db_mysql
 
-# 2) 启动(项目名固定为 mysql, 网络 172.186.0.0/24 双栈)
+# 2) 启动(项目名固定为 mysql, 网络 172.21.4.0/24 双栈)
 docker compose up -d
 
 # 3) 查看日志 / 状态(日志包含自动调优摘要)
@@ -234,6 +235,25 @@ mysql -h127.0.0.1 -P3306 -uroot -p
 
 ---
 
+## 网络规划
+
+compose 网络统一以组件名开头（`mysql_` / `mysql_mgr_`），不使用 `app_net` 这类通用名称；
+网段在 `172.21.0.0/24` + `fe99::/64` 规划内**避让已占用网段**，保证同主机多组件共存不冲突。
+
+| 组件 | 网络名 | IPv4 | IPv6 | 容器地址 |
+| --- | --- | --- | --- | --- |
+| mysql（单机） | `mysql_net` | `172.21.4.0/24` | `fe99:4::/64` | `.2` = mysql、`.3` = backup |
+| mysql（MGR 集群） | `mysql_mgr_net` | `172.21.5.0/24` | `fe99:5::/64` | `.11/.12/.13` = 三节点、`.14` = backup |
+| php-docker（已占用） | `php` | `172.21.0.0/24` | `fd98::/64` | — |
+| pg-docker（已占用） | `pg_net` / `pg_cluster_net` | `172.22.0.0/24` / `172.22.1.0/24` | `fe9a::/64` / `fe9a:1::/64` | — |
+
+- 两套 mysql 栈（`mysql`、`mysql-mgr` 项目名）可同时启动，网段互不重叠
+- 固定 IPv4 的意义：MGR 的 `group_replication_local_address` 必须稳定，重启后不能变化
+- IPv6 目前仅网络层启用，MySQL 默认监听 IPv4（`bind_address=0.0.0.0`）；需要 IPv6 访问时把
+  `my.cnf` 的 `bind_address` 改为 `*`
+
+---
+
 ## MGR 3 节点集群部署
 
 > 设计参考 `workspace/k8s/mysql-cluster`（Percona Operator + MGR 单主模式 + 3 副本），
@@ -244,14 +264,14 @@ mysql -h127.0.0.1 -P3306 -uroot -p
 ```
         ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
         │ mysql-mgr-1  │   │ mysql-mgr-2  │   │ mysql-mgr-3  │
-        │172.186.1.11  │   │172.186.1.12  │   │172.186.1.13  │
+        │172.21.5.11  │   │172.21.5.12  │   │172.21.5.13  │
         │  host:13306  │   │  host:13307  │   │  host:13308  │
         └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
                └──────── 33061 组通信(XCom) ─────────┘
                   单主模式：自动选举 Primary / Secondary
 ```
 
-- 网络：独立 bridge 网络 `172.186.1.0/24`（双栈，另含 `2066:1::/64`），固定 IP 保证
+- 网络：独立 bridge 网络 `172.21.5.0/24`（双栈，另含 `fe99:5::/64`），固定 IP 保证
   `group_replication_local_address` 稳定；compose 项目名固定为 `mysql-mgr`，与单机栈互不冲突
 - 数据：`./data/mgr/mysql-mgr-{1,2,3}`
 - 配置：`conf/mysql/my.cnf`（基础，只读挂载）+ 镜像内 `conf/mysql/conf.d/mgr.cnf`（组复制）
@@ -276,7 +296,7 @@ docker logs -f mysql-mgr-1
 首次启动日志关键行：
 
 ```
-[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.186.1.11:33061 bootstrap=ON seeds=...
+[Entrypoint]: MGR 配置已生成: server_id=1 local_address=172.21.5.11:33061 bootstrap=ON seeds=...
 [Entrypoint]: MGR: 配置分布式恢复通道 (repl)
 [Entrypoint]: MGR: 首次启动, 本次将引导新组(bootstrap=ON)
 ```
@@ -677,6 +697,7 @@ docker compose -f docker-compose-mgr.yml --profile backup run --rm backup full
 | `XB_RETENTION_DAYS` | `7` | 增量保留天数 |
 | `XB_BACKUP_TIME` | `03:00` | 每日备份时间（容器时区） |
 | `XB_USER` / `XB_PASSWORD` | `root` / `$MYSQL_ROOT_PASSWORD` | 备份账号（需 `BACKUP_ADMIN` 权限） |
+| `XB_OWNER` | `mysql:mysql` | 恢复后数据目录属主（容器内无该用户时回退 `1001:1001`） |
 | `XB_EXTRA_ARGS` | 空 | 追加给 xtrabackup 的额外参数 |
 
 ### 逻辑备份（补充）
@@ -702,7 +723,7 @@ docker exec mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" \
 - 确认三个节点的 `MYSQL_REPL_USER` / `MYSQL_REPL_PASSWORD` 一致；
 - 8.4 已禁用 `mysql_native_password`，本镜像使用 `caching_sha2_password` +
   `group_replication_recovery_get_public_key=ON`；
-- 确认 `MYSQL_MGR_GROUP_SEEDS` 中地址可达（`docker exec mysql-mgr-2 ping -c1 172.30.8.11`）。
+- 确认 `MYSQL_MGR_GROUP_SEEDS` 中地址可达（`docker exec mysql-mgr-2 ping -c1 172.21.5.11`）。
 
 **3. 第二个节点把第一个节点的组"抢"了 / 出现两个组**
 

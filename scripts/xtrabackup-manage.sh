@@ -19,6 +19,7 @@
 #   XB_PASSWORD            备份账号密码(默认取 MYSQL_ROOT_PASSWORD)
 #   XB_SOCKET              socket 路径(默认 /var/run/mysqld/mysqld.sock)
 #   XB_DATADIR             数据目录(默认 /var/lib/mysql)
+#   XB_OWNER               恢复后数据目录属主(默认 mysql:mysql, 失败时回退 1001:1001)
 #   XB_PARALLEL            并行线程数(默认 2)
 #   XB_COMPRESS            none|zstd|lz4(默认 none, 压缩影响恢复速度)
 #   XB_KEEP_FULL           保留最近几份全量(含其增量, 默认 2)
@@ -41,6 +42,7 @@ XB_USER="${XB_USER:-root}"
 XB_PASSWORD="${XB_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
 XB_SOCKET="${XB_SOCKET:-/var/run/mysqld/mysqld.sock}"
 XB_DATADIR="${XB_DATADIR:-/var/lib/mysql}"
+XB_OWNER="${XB_OWNER:-mysql:mysql}"
 XB_PARALLEL="${XB_PARALLEL:-2}"
 XB_COMPRESS="${XB_COMPRESS:-none}"
 XB_KEEP_FULL="${XB_KEEP_FULL:-2}"
@@ -246,6 +248,7 @@ cmd_restore() {
     local src="${1:-}"
     [ -n "$src" ] || die "用法: xtrabackup-manage.sh restore <备份目录>"
     src="${src%/}"
+    [[ "$src" != /* ]] && src="${XB_BACKUP_DIR}/${src}"
     [ -d "$src" ] || die "备份目录不存在: $src"
     [ -f "$src/xtrabackup_checkpoints" ] || die "不是有效的 xtrabackup 备份目录: $src"
 
@@ -267,7 +270,14 @@ cmd_restore() {
 
     log "开始恢复 → ${XB_DATADIR}"
     "$XB_BIN" --copy-back --target-dir="$src" --datadir="$XB_DATADIR" 2>&1 | sed 's/^/  /'
-    chown -R mysql:mysql "$XB_DATADIR"
+    # 备份镜像(percona/percona-xtrabackup)可能没有 mysql 用户, 回退到本镜像固定的 1001:1001
+    if ! chown -R "$XB_OWNER" "$XB_DATADIR" 2>/dev/null; then
+        if chown -R 1001:1001 "$XB_DATADIR" 2>/dev/null; then
+            log "数据目录属主已设置为 1001:1001(本镜像 mysql 的 UID/GID)"
+        else
+            warn "无法设置数据目录属主(${XB_OWNER} / 1001:1001), 请在启动容器前手工 chown"
+        fi
+    fi
     log "恢复完成。请启动 MySQL 并检查错误日志:"
     log "  docker start <容器名>  (或 docker compose up -d)"
     log "  MGR 集群: 建议用 clone 插件重建故障成员, 或将本次备份恢复到新节点后再加入组"
