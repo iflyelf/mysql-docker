@@ -3,6 +3,7 @@
 .github
 .env_vars
 data
+backup
 logs
 *.log
 README.md

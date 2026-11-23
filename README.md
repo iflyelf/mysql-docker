@@ -608,6 +608,8 @@ mysql-docker/
 
 > XtraBackup 不打包进 MySQL 镜像（保持运行镜像精简），通过官方 `percona/percona-xtrabackup:8.4`
 > 镜像以**独立备份容器**运行；数据目录以只读方式挂载给它，通过 TCP 连接实例。
+> 首次使用前请确保备份镜像已就绪：`docker pull percona/percona-xtrabackup:8.4`
+> （该镜像与本项目 Percona Server 8.4 版本匹配；不建议使用 8.0 的 xtrabackup 备份 8.4 实例）。
 
 ### 目录结构与保留策略
 
@@ -683,7 +685,8 @@ docker compose -f docker-compose-mgr.yml --profile backup run --rm backup full
 - **全集群灾难恢复**：按「单机恢复」步骤把备份恢复到 mysql-mgr-1，清空其他节点数据目录后依次启动
   （mysql-mgr-1 需保留 `MYSQL_MGR_BOOTSTRAP=1` 且删除 `.mgr_bootstrapped` 重新引导）；
   恢复后核对 `xtrabackup_binlog_info` 中的 GTID 与组内一致
-- 备份期间 `xtrabackup` 会短暂加全局锁（`--no-backup-locks=false` 默认使用 backup locks，MySQL 8.4 无阻塞）
+- 备份使用 backup locks + redo 日志复制，InnoDB 表不会被长时间阻塞；本镜像已禁用 MyISAM，
+  不存在长时间全局锁问题
 
 ### 常用环境变量（backup 服务）
 
